@@ -5,7 +5,7 @@ Perception chain verification (Step B):
 
 Usage:
   cd nanobot/
-  DISPLAY=:1 conda run -n lerobot python -m openarm_mcp.calib.detect_3d
+  conda run -n lerobot python -m openarm_mcp.calib.detect_3d
 
 Controls:
   [q] quit
@@ -37,7 +37,8 @@ def load_calib():
         hc = json.load(f)
     K          = np.array(cc["K"],         dtype=np.float64)
     dist       = np.array(cc["dist"],      dtype=np.float64)
-    T_base_cam = np.array(hc["T_base_cam"], dtype=np.float64)
+    # T_cam_base: 相机坐标系 → 机器人基坐标系（calibrateHandEye 输出，传入 inv(FK) 时）
+    T_base_cam = np.array(hc["T_cam_base"], dtype=np.float64)
     return K, dist, T_base_cam
 
 

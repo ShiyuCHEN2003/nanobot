@@ -4,6 +4,7 @@
 
 用法（在 ROS2 环境下）：
   source /opt/ros/humble/setup.bash
+  ./script/launch_unilateral_ros2.sh right_arm can2 can1
   python openarm_mcp/read_fk_ros.py --topic /openarm_follower/joint_states
 """
 

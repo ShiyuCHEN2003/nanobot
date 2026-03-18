@@ -4,7 +4,7 @@ Detect ChArUco board lower-left corner, solve IK, print target joint angles.
 
 Usage:
   cd nanobot/
-  DISPLAY=:1 python -m openarm_mcp.calib.reach_board_corner --canport can2 --serial 352122271543
+  python -m openarm_mcp.calib.reach_board_corner --canport can2 --serial 352122271543
 
 Press [SPACE] to detect board and solve IK.
 """

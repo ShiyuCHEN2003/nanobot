@@ -16,29 +16,15 @@ Result: T_cam_base  (base origin in camera frame)
         T_base_cam  (camera origin in base frame)
 """
 
-import sys, os, argparse, json, time
+import sys, os, argparse, json, time, subprocess, threading
 import numpy as np
 import cv2
-
-
-def _quiet_cv2_logs():
-    try:
-        cv2.setLogLevel(0)
-        return
-    except AttributeError:
-        pass
-
-    try:
-        cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_SILENT)
-    except Exception:
-        pass
-
-
-_quiet_cv2_logs()
-
+try:
+    cv2.setLogLevel(0)
+except AttributeError:
+    pass
 from scipy.spatial.transform import Rotation as Rot
 import pyrealsense2 as rs
-import xarm_can as oa
 
 # Add parent directory to path for imports
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -59,16 +45,32 @@ MARKER_M   = 0.022
 DICT_ID    = cv2.aruco.DICT_4X4_50
 MIN_FRAMES = 15
 
-# ── Motor config ──
-MOTOR_TYPES = [
-    oa.MotorType.DM8009, oa.MotorType.DM8009,
-    oa.MotorType.DM4340, oa.MotorType.DM4340,
-    oa.MotorType.DM4310, oa.MotorType.DM4310, oa.MotorType.DM4310,
-]
-MASTER_IDS = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07]
-SLAVE_IDS  = [0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17]
-
 RIGHT_ARM_QPOS_SLICE = slice(9, 16)
+
+
+class RosJointReader:
+    """用 Python 3.10 子进程读 ROS2 joint states，通过 stdout JSON 行传给主进程。"""
+    def __init__(self, topic: str, arm_side: str = "right"):
+        self.latest_q7 = None
+        helper = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_ros_joint_helper.py")
+        cmd = f"source /opt/ros/humble/setup.bash && /usr/bin/python3 {helper} {topic} {arm_side}"
+        self._proc = subprocess.Popen(
+            ["bash", "-c", cmd],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+        )
+        self._thread = threading.Thread(target=self._read_loop, daemon=True)
+        self._thread.start()
+
+    def _read_loop(self):
+        for line in self._proc.stdout:
+            try:
+                self.latest_q7 = np.array(json.loads(line.strip()), dtype=float)
+            except Exception:
+                pass
+
+    def destroy(self):
+        self._proc.terminate()
+        self._proc.wait(timeout=2)
 
 
 # ────────────────────────────────────────────
@@ -149,6 +151,34 @@ def to_T(rvec, tvec):
     return T
 
 
+def rvec_to_rpy_deg(rvec):
+    R, _ = cv2.Rodrigues(rvec)
+    return Rot.from_matrix(R).as_euler('xyz', degrees=True)
+
+
+def draw_frame_axes_safe(img, K, dist, rvec, tvec, axis_len=0.05):
+    h, w = img.shape[:2]
+    obj = np.float32([
+        [0.0, 0.0, 0.0],
+        [axis_len, 0.0, 0.0],
+        [0.0, axis_len, 0.0],
+        [0.0, 0.0, axis_len],
+    ])
+    pts, _ = cv2.projectPoints(obj, rvec, tvec, K, dist)
+    pts = pts.reshape(-1, 2)
+
+    def in_view(p):
+        return 0 <= p[0] < w and 0 <= p[1] < h
+
+    o, x, y, z = pts
+    if in_view(o) and in_view(x):
+        cv2.line(img, tuple(np.int32(o)), tuple(np.int32(x)), (0, 0, 255), 2)
+    if in_view(o) and in_view(y):
+        cv2.line(img, tuple(np.int32(o)), tuple(np.int32(y)), (0, 255, 0), 2)
+    if in_view(o) and in_view(z):
+        cv2.line(img, tuple(np.int32(o)), tuple(np.int32(z)), (255, 0, 0), 2)
+
+
 def inv_T(T):
     T_inv = np.eye(4)
     T_inv[:3, :3] = T[:3, :3].T
@@ -170,6 +200,8 @@ def main():
     parser.add_argument("--canport", default="can2")
     parser.add_argument("--serial",  default="314422070707")
     parser.add_argument("--out",     default="calib_handeye_chest.json")
+    parser.add_argument("--joint-topic", default="/openarm_leader/joint_states")
+    parser.add_argument("--arm-side", default="right", choices=["right", "left"])
     args = parser.parse_args()
 
     with open(CALIB_IN) as f:
@@ -196,15 +228,11 @@ def main():
     cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(WIN, 1280, 960)
 
-    xarm = oa.XArm(args.canport, True)
-    xarm.init_arm_motors(MOTOR_TYPES, MASTER_IDS, SLAVE_IDS)
-    xarm.init_gripper_motor(oa.MotorType.DM4310, 0x08, 0x18)
-    xarm.set_callback_mode_all(oa.CallbackMode.STATE)
-    xarm.enable_all()
-    time.sleep(0.1)
-    xarm.recv_all()
-    arm = xarm.get_arm()
-    print("Arm ready")
+    joint_reader = RosJointReader(args.joint_topic, args.arm_side)
+    print(f"ROS joint reader ready: topic={args.joint_topic}, arm_side={args.arm_side}")
+    if "follower" in args.joint_topic.lower():
+        print("[WARN] 当前使用 follower 话题，可能是目标关节而非实测关节，手眼标定易失真。")
+        print("[WARN] 建议改为 /openarm_leader/joint_states 或对应硬件反馈话题。")
 
     # eye-to-hand: collect T_base_ee (FK) and T_cam_board (PnP)
     R_gripper2base, t_gripper2base = [], []
@@ -222,9 +250,7 @@ def main():
             color  = np.asanyarray(frames.get_color_frame().get_data())
             gray   = cv2.cvtColor(color, cv2.COLOR_BGR2GRAY)
 
-            xarm.refresh_all()
-            xarm.recv_all()
-            q7 = np.array([m.get_position() for m in arm.get_motors()])
+            q7 = joint_reader.latest_q7
 
             ok, rvec, tvec, aruco_draw, charuco_draw, reproj_rmse, board_dist = detect(
                 gray, dic, board, detector, charuco_detector, K, dist)
@@ -233,10 +259,11 @@ def main():
             if ok:
                 cv2.aruco.drawDetectedMarkers(disp, aruco_draw[0], aruco_draw[1])
                 cv2.aruco.drawDetectedCornersCharuco(disp, charuco_draw[0], charuco_draw[1])
-                cv2.drawFrameAxes(disp, K, dist, rvec, tvec, 0.05)
+                draw_frame_axes_safe(disp, K, dist, rvec, tvec, axis_len=0.05)
 
-            cv2.rectangle(disp, (0, 0), (640, 80), (0, 0, 0), -1)
-            cv2.putText(disp, f"Captured: {count}  q7={np.round(q7,2)}", (10, 28),
+            cv2.rectangle(disp, (0, 0), (640, 130), (0, 0, 0), -1)
+            q7_text = np.round(q7, 2) if q7 is not None else "waiting ROS joints..."
+            cv2.putText(disp, f"Captured: {count}  q7={q7_text}", (10, 28),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
             hint_color = (0, 220, 0) if ok else (0, 60, 220)
             if ok:
@@ -245,12 +272,30 @@ def main():
                 hint_text = "No board - adjust angle"
             cv2.putText(disp, hint_text, (10, 62),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, hint_color, 2)
+            if ok:
+                t = tvec.ravel()
+                rpy_cam_board = rvec_to_rpy_deg(rvec)
+                cv2.putText(
+                    disp,
+                    f"cam->board t=({t[0]:+.3f},{t[1]:+.3f},{t[2]:+.3f})m  rpy=({rpy_cam_board[0]:+.1f},{rpy_cam_board[1]:+.1f},{rpy_cam_board[2]:+.1f})deg",
+                    (10, 94),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    (255, 255, 0),
+                    2,
+                )
+            if q7 is None:
+                cv2.putText(disp, "No JointState yet - check ROS topic", (10, 122),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 120, 255), 2)
 
             disp_big = cv2.resize(disp, (1280, 960))
             cv2.imshow(WIN, disp_big)
             key = cv2.waitKey(1) & 0xFF
 
             if key == ord(' ') and ok:
+                if q7 is None:
+                    print("  [skip] no ROS JointState data yet")
+                    continue
                 if board_dist < 0.10 or board_dist > 1.20:
                     print(f"  [skip] invalid board_dist={board_dist:.3f}m")
                     continue
@@ -260,6 +305,12 @@ def main():
 
                 T_base_ee   = fk(q7)
                 T_cam_board = to_T(rvec, tvec)
+                
+                # Debug: print raw transformation matrices
+                print(f"\n--- 帧{count+1} 原始矩阵 ---")
+                print(f"T_base_ee:\n{T_base_ee.round(4)}")
+                print(f"T_cam_board:\n{T_cam_board.round(4)}")
+                
                 R_gripper2base.append(T_base_ee[:3, :3])
                 t_gripper2base.append(T_base_ee[:3,  3].reshape(3, 1))
                 R_target2cam.append(T_cam_board[:3, :3])
@@ -268,9 +319,13 @@ def main():
                 T_cam_board_list.append(T_cam_board)
                 count += 1
                 rpy = Rot.from_matrix(T_base_ee[:3,:3]).as_euler('xyz', degrees=True)
+                rpy_cam_board = rvec_to_rpy_deg(rvec)
+                t_cam_board = T_cam_board[:3, 3]
                 print(f"  [{count:02d}] ee={T_base_ee[:3,3].round(3)}  "
                       f"rpy=({rpy[0]:.1f},{rpy[1]:.1f},{rpy[2]:.1f})deg  "
                       f"board_dist={board_dist:.3f}m  rmse={reproj_rmse:.2f}px")
+                print(f"       cam->board t=({t_cam_board[0]:+.3f},{t_cam_board[1]:+.3f},{t_cam_board[2]:+.3f})m  "
+                      f"rpy=({rpy_cam_board[0]:+.1f},{rpy_cam_board[1]:+.1f},{rpy_cam_board[2]:+.1f})deg")
 
             elif key == ord('c'):
                 if count < MIN_FRAMES:
@@ -285,9 +340,11 @@ def main():
     finally:
         pipeline.stop()
         cv2.destroyAllWindows()
-        xarm.disable_all()
+        joint_reader.destroy()
 
-    # ── Compute (eye-to-hand: invert EE poses) ──
+    # ── Compute (eye-to-hand) ──
+    # 对于 eye-to-hand（相机固定、标定板在末端），这里使用 base->gripper 形式
+    # （即从 T_base_ee 取逆得到 T_ee_base 后传入 calibrateHandEye）
     R_base2gripper, t_base2gripper = [], []
     for R, t in zip(R_gripper2base, t_gripper2base):
         T = np.eye(4)
