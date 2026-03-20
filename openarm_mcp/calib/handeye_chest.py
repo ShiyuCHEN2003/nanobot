@@ -311,8 +311,9 @@ def main():
                 print(f"T_base_ee:\n{T_base_ee.round(4)}")
                 print(f"T_cam_board:\n{T_cam_board.round(4)}")
                 
-                R_gripper2base.append(T_base_ee[:3, :3])
-                t_gripper2base.append(T_base_ee[:3,  3].reshape(3, 1))
+                T_ee_base = inv_T(T_base_ee)  # eye-to-hand 需要传 base2gripper（取逆）
+                R_gripper2base.append(T_ee_base[:3, :3])
+                t_gripper2base.append(T_ee_base[:3,  3].reshape(3, 1))
                 R_target2cam.append(T_cam_board[:3, :3])
                 t_target2cam.append(T_cam_board[:3,  3].reshape(3, 1))
                 T_base_ee_list.append(T_base_ee)
@@ -343,34 +344,100 @@ def main():
         joint_reader.destroy()
 
     # ── Compute (eye-to-hand) ──
-    # 对于 eye-to-hand（相机固定、标定板在末端），这里使用 base->gripper 形式
-    # （即从 T_base_ee 取逆得到 T_ee_base 后传入 calibrateHandEye）
-    R_base2gripper, t_base2gripper = [], []
-    for R, t in zip(R_gripper2base, t_gripper2base):
-        T = np.eye(4)
-        T[:3, :3] = R
-        T[:3,  3] = t.ravel()
-        Ti = inv_T(T)
-        R_base2gripper.append(Ti[:3, :3])
-        t_base2gripper.append(Ti[:3,  3].reshape(3, 1))
+    # eye-to-hand 正确约定：
+    #   第1组传 T_gripper2base（即 T_base_ee，FK直接输出，不需要取逆）
+    #   第2组传 T_target2cam  （即 T_cam_board，PnP直接输出）
+    # 结果 R_x, t_x 是 T_cam_base（相机相对于base的变换）
+    from scipy.optimize import minimize
 
-    print(f"\nComputing eye-to-hand transform using {count} frames (Tsai)...")
-    R_x, t_x = cv2.calibrateHandEye(
-        R_base2gripper, t_base2gripper,
-        R_target2cam,   t_target2cam,
-        method=cv2.CALIB_HAND_EYE_TSAI,
-    )
+    # ── 方法1: calibrateHandEye (使用多种方法取最优) ──
+    best_T_base_cam = None
+    best_std = float('inf')
 
-    T_cam_base = np.eye(4)
-    T_cam_base[:3, :3] = R_x
-    T_cam_base[:3,  3] = t_x.ravel()
-    T_base_cam = inv_T(T_cam_base)
+    for method_name, method in [
+        ("TSAI",   cv2.CALIB_HAND_EYE_TSAI),
+        ("HORAUD", cv2.CALIB_HAND_EYE_HORAUD),
+        ("ANDREFF",cv2.CALIB_HAND_EYE_ANDREFF),
+        ("DANIILIDIS", cv2.CALIB_HAND_EYE_DANIILIDIS),
+    ]:
+        try:
+            # eye-to-hand 
+            R_x, t_x = cv2.calibrateHandEye(
+                R_gripper2base, t_gripper2base,   # inv(T_base_ee) 的 R, t（eye-to-hand 需取逆）
+                R_target2cam,   t_target2cam,      # T_cam_board 的 R, t，结果为 T_base_cam
+                method=method,
+            )
+            T_base_cam_try = np.eye(4)
+            T_base_cam_try[:3, :3] = R_x
+            T_base_cam_try[:3,  3] = t_x.ravel()
+
+            # 计算 consistency std
+            pts = []
+            for T_be, T_cb in zip(T_base_ee_list, T_cam_board_list):
+                T_eb = inv_T(T_be) @ T_base_cam_try @ T_cb
+                pts.append(T_eb[:3, 3])
+            pts = np.array(pts)
+            std_total = float(np.sum(np.std(pts, axis=0)) * 1000)
+            print(f"  {method_name:12s}: std={std_total:.1f}mm  cam_pos={T_base_cam_try[:3,3].round(3)}")
+
+            if std_total < best_std:
+                best_std = std_total
+                best_T_base_cam = T_base_cam_try
+        except Exception as e:
+            print(f"  {method_name:12s}: 失败 {e}")
+
+    # ── 方法2: 直接优化（当 calibrateHandEye 结果差时自动启用）──
+    print(f"\ncalibrateHandEye 最优 std={best_std:.1f}mm，尝试直接优化...")
+
+    def cost(params):
+        R_bc = Rot.from_rotvec(params[:3]).as_matrix()
+        T_bc = np.eye(4)
+        T_bc[:3, :3] = R_bc
+        T_bc[:3,  3] = params[3:]
+        pts = []
+        for T_be, T_cb in zip(T_base_ee_list, T_cam_board_list):
+            pts.append((inv_T(T_be) @ T_bc @ T_cb)[:3, 3])
+        pts = np.array(pts)
+        return float(np.sum(np.var(pts, axis=0)))
+
+    # 用 calibrateHandEye 最优结果作为初始值
+    r0 = Rot.from_matrix(best_T_base_cam[:3, :3]).as_rotvec()
+    t0 = best_T_base_cam[:3, 3]
+    res = minimize(cost, np.concatenate([r0, t0]), method='Nelder-Mead',
+                   options={'maxiter': 200000, 'xatol': 1e-7, 'fatol': 1e-9})
+
+    T_base_cam_opt = np.eye(4)
+    T_base_cam_opt[:3, :3] = Rot.from_rotvec(res.x[:3]).as_matrix()
+    T_base_cam_opt[:3,  3] = res.x[3:]
+
+    pts_opt = []
+    for T_be, T_cb in zip(T_base_ee_list, T_cam_board_list):
+        pts_opt.append((inv_T(T_be) @ T_base_cam_opt @ T_cb)[:3, 3])
+    pts_opt = np.array(pts_opt)
+    std_opt = float(np.sum(np.std(pts_opt, axis=0)) * 1000)
+    print(f"  直接优化:    std={std_opt:.1f}mm  cam_pos={T_base_cam_opt[:3,3].round(3)}")
+
+    # 选择更好的结果
+    if std_opt < best_std:
+        T_base_cam = T_base_cam_opt
+        method_used = "direct_optimization"
+        final_std = std_opt
+        print("  → 使用直接优化结果")
+    else:
+        T_base_cam = best_T_base_cam
+        method_used = "calibrateHandEye"
+        final_std = best_std
+        print("  → 使用 calibrateHandEye 结果")
+
+    T_cam_base = inv_T(T_base_cam)
 
     print(f"\nT_cam_base:\n{T_cam_base.round(4)}")
     print(f"\nT_base_cam:\n{T_base_cam.round(4)}")
     print(f"Camera position in base frame (m): {T_base_cam[:3,3].round(4)}")
+    cam_z = T_base_cam[:3, :3] @ np.array([0, 0, 1])
+    print(f"Camera optical axis in base frame: {cam_z.round(4)}")
 
-    # ── Consistency check: T_ee_board should be almost constant across captures ──
+    # ── Consistency check ──
     ee_board_Ts = []
     for T_base_ee, T_cam_board in zip(T_base_ee_list, T_cam_board_list):
         T_ee_board = inv_T(T_base_ee) @ T_base_cam @ T_cam_board
@@ -383,6 +450,7 @@ def main():
         r_err = [rot_angle_deg(r_ref, T[:3, :3]) for T in ee_board_Ts[1:]]
         print("\n[Quality]")
         print(f"  EE->Board position std (mm): {np.round(p_std_mm, 2)}")
+        print(f"  EE->Board mean t (m): {p.mean(axis=0).round(4)}  (板固定在EE上应为固定小值)")
         if len(r_err) > 0:
             print(f"  EE->Board rotation diff wrt frame0 (deg): mean={np.mean(r_err):.2f}, max={np.max(r_err):.2f}")
 
@@ -390,8 +458,12 @@ def main():
         json.dump({
             "T_cam_base": T_cam_base.tolist(),
             "T_base_cam": T_base_cam.tolist(),
-            "method": "TSAI",
+            "method": method_used,
             "n_frames": count,
+            "consistency_std_mm": np.std(p, axis=0).tolist() if len(ee_board_Ts) >= 2 else None,
+            # 保存原始数据供离线重分析
+            "T_base_ee_list": [T.tolist() for T in T_base_ee_list],
+            "T_cam_board_list": [T.tolist() for T in T_cam_board_list],
         }, f, indent=2)
     print(f"\nSaved to {args.out}")
 
