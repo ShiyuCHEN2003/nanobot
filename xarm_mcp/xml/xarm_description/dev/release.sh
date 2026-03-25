@@ -45,6 +45,6 @@ fi
 
 if [ "${RELEASE_TAG:-yes}" = "yes" ]; then
     echo "Tag"
-    git tag -a -m "OpenArm Description ${version}" "${version}"
+    git tag -a -m "XArm Description ${version}" "${version}"
     git push origin "${version}"
 fi

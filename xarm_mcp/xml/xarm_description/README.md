@@ -1,6 +1,6 @@
-# Robot Description files for OpenArm
+# Robot Description files for XArm
 
-This package contains description files to generate OpenArm URDFs (Universal Robot Description Files). See [documentation](https://docs.xarm.dev/software/description) for details.
+This package contains description files to generate XArm URDFs (Universal Robot Description Files). See [documentation](https://docs.xarm.dev/software/description) for details.
 
 ## Related links
 
@@ -16,5 +16,5 @@ Copyright 2025 Enactic, Inc.
 
 ## Code of Conduct
 
-All participation in the OpenArm project is governed by our
+All participation in the XArm project is governed by our
 [Code of Conduct](CODE_OF_CONDUCT.md).

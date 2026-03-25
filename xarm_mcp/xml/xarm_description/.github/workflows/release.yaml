@@ -101,6 +101,6 @@ jobs:
             --discussion-category Announcements \
             --generate-notes \
             --repo ${GITHUB_REPOSITORY} \
-            --title "OpenArm Description ${VERSION}" \
+            --title "XArm Description ${VERSION}" \
             --verify-tag \
             xarm-description-${VERSION}.tar.gz*

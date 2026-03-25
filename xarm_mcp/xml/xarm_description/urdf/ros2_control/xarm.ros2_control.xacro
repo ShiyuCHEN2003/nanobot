@@ -22,7 +22,7 @@
             <param name="state_following_offset">0.0</param>
           </xacro:if>
           <xacro:if value="${use_fake_hardware == 0}">
-            <plugin>xarm_hardware/OpenArm_${arm_type}HW</plugin>
+            <plugin>xarm_hardware/XArm_${arm_type}HW</plugin>
             <param name="can_interface">${can_interface}</param>
             <param name="arm_prefix">${arm_prefix}</param>
             <param name="hand">${hand}</param>

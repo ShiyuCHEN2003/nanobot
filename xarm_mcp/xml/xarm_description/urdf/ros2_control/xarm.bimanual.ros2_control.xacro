@@ -22,7 +22,7 @@
             <param name="state_following_offset">0.0</param>
           </xacro:if>
           <xacro:unless value="${use_fake_hardware}">
-            <plugin>xarm_hardware/OpenArm_v10HW</plugin>
+            <plugin>xarm_hardware/XArm_v10HW</plugin>
             <param name="can_interface">${left_can_interface}</param>
             <param name="arm_prefix">${left_arm_prefix}</param>
             <param name="hand">${hand}</param>
@@ -73,7 +73,7 @@
             <param name="state_following_offset">0.0</param>
           </xacro:if>
           <xacro:unless value="${use_fake_hardware}">
-            <plugin>xarm_hardware/OpenArm_v10HW</plugin>
+            <plugin>xarm_hardware/XArm_v10HW</plugin>
             <param name="can_interface">${right_can_interface}</param>
             <param name="arm_prefix">${right_arm_prefix}</param>
             <param name="hand">${hand}</param>

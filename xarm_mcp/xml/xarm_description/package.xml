@@ -18,7 +18,7 @@
 <package format="3">
   <name>xarm_description</name>
   <version>1.0.0</version>
-  <description>URDF with optional configuration parameters for OpenArm</description>
+  <description>URDF with optional configuration parameters for XArm</description>
   <maintainer email="xarm_dev@enactic.ai">Enactic, Inc.</maintainer>
   <license>Apache-2.0</license>
 

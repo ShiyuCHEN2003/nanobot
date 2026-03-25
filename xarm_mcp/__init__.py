@@ -1,1 +1,1 @@
-"""OpenArm MCP - OpenArm Model Context Protocol"""
+"""XArm MCP - XArm Model Context Protocol"""
