@@ -158,7 +158,14 @@ def execute_grasp(world_xyz, canport: str = CANPORT_DEFAULT) -> dict:
         canport:   CAN总线端口，默认 can2
 
     Returns:
-        {"success": bool, "message": str}
+        {
+            "success": bool,
+            "message": str,
+            "ik": {
+                "pre_grasp": {"q_rad": [...], "q_deg": [...], "pos_error_mm": float},
+                "grasp": {"q_rad": [...], "q_deg": [...], "pos_error_mm": float},
+            }
+        }
     """
     from xarm_mcp.arm_control import read_q7, move_joints, hold, gripper_close, gripper_open
 
@@ -225,8 +232,12 @@ def execute_grasp(world_xyz, canport: str = CANPORT_DEFAULT) -> dict:
     except Exception as e:
         return {"success": False, "message": f"运动执行失败: {e}"}
 
-    pre_err_mm = result_pre.pos_errors.get('right', 0)
-    grasp_err_mm = result_grasp.pos_errors.get('right', 0)
+    pre_err_mm = float(result_pre.pos_errors.get('right', 0))
+    grasp_err_mm = float(result_grasp.pos_errors.get('right', 0))
+    q7_pre_rad = q7_pre.astype(float).tolist()
+    q7_grasp_rad = q7_grasp.astype(float).tolist()
+    q7_pre_deg = np.degrees(q7_pre).astype(float).tolist()
+    q7_grasp_deg = np.degrees(q7_grasp).astype(float).tolist()
     return {
         "success": True,
         "message": (
@@ -234,4 +245,16 @@ def execute_grasp(world_xyz, canport: str = CANPORT_DEFAULT) -> dict:
             f"预抓取IK误差={pre_err_mm:.1f}mm，"
             f"抓取IK误差={grasp_err_mm:.1f}mm"
         ),
+        "ik": {
+            "pre_grasp": {
+                "q_rad": q7_pre_rad,
+                "q_deg": q7_pre_deg,
+                "pos_error_mm": pre_err_mm,
+            },
+            "grasp": {
+                "q_rad": q7_grasp_rad,
+                "q_deg": q7_grasp_deg,
+                "pos_error_mm": grasp_err_mm,
+            },
+        },
     }
