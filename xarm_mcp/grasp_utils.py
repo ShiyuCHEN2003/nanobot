@@ -19,6 +19,8 @@ SCENE_XML            = os.path.join(_HERE, "xml/scene.xml")
 RIGHT_ARM_QPOS_SLICE = slice(9, 16)
 PRE_GRASP_Z          = 0.10   # 预抓取点比目标高 10cm
 CANPORT_DEFAULT      = "can2"
+INIT_Q7_DEG          = np.array([0, 20, 0, 60, 0, 0, 0], dtype=float)
+INIT_GRIPPER_DEG     = 0.0
 
 # 中英文标签同义词表
 LABEL_SYNONYMS = {
@@ -63,7 +65,7 @@ def _build_ik():
     base_qpos = solver.data.qpos.copy()
 
     SEEDS = [
-        np.array([0,  0,  0,  np.pi/2, 0, 0, 0]),
+        np.array([0,  np.deg2rad(20),  0,  np.pi/2, 0, 0, 0]),
         np.array([0,  0.3,  0,  np.pi/2, 0, 0, 0]),
         np.array([0.3, 0,  0,  np.pi/2, 0, 0, 0]),
         np.array([-0.3, 0, 0,  np.pi/2, 0, 0, 0]),
@@ -105,9 +107,14 @@ def get_arm_resources(canport: str = CANPORT_DEFAULT):
     """懒初始化机械臂和 IK 求解器（进程内只执行一次）。"""
     global _arm_state, _ik_fn
     if _arm_state is None:
-        from xarm_mcp.arm_control import build_arm, gripper_open
+        from xarm_mcp.arm_control import build_arm, move_joints, hold, gripper_open, gripper_close
         xarm, arm, gripper = build_arm(canport)
-        gripper_open(xarm, gripper)
+        move_joints(xarm, arm, np.deg2rad(INIT_Q7_DEG), duration=3.0)
+        if INIT_GRIPPER_DEG <= -10:
+            gripper_open(xarm, gripper)
+        else:
+            gripper_close(xarm, gripper)
+        hold(xarm, arm, duration=0.3)
         _arm_state = {"xarm": xarm, "arm": arm, "gripper": gripper}
     if _ik_fn is None:
         _ik_fn = _build_ik()
@@ -255,6 +262,80 @@ def execute_grasp(world_xyz, canport: str = CANPORT_DEFAULT) -> dict:
                 "q_rad": q7_grasp_rad,
                 "q_deg": q7_grasp_deg,
                 "pos_error_mm": grasp_err_mm,
+            },
+        },
+    }
+
+
+def execute_place(world_xyz, canport: str = CANPORT_DEFAULT) -> dict:
+    """
+    执行放置动作序列：移到目标上方 → 下降 → 张开夹爪 → 抬起。
+
+    Args:
+        world_xyz: 放置目标位置3D世界坐标 [x, y, z]，单位米（如盘子中心）
+        canport:   CAN总线端口，默认 can2
+
+    Returns:
+        {"success": bool, "message": str, "ik": {...}}
+    """
+    from xarm_mcp.arm_control import read_q7, move_joints, hold, gripper_open
+
+    try:
+        arm_state, ik = get_arm_resources(canport)
+    except Exception as e:
+        return {"success": False, "message": f"机械臂初始化失败: {e}"}
+
+    xarm = arm_state["xarm"]
+    arm = arm_state["arm"]
+    gripper = arm_state["gripper"]
+
+    pos_world = np.array(world_xyz, dtype=float)
+
+    # 读取当前关节角
+    try:
+        xarm.refresh_all()
+        xarm.recv_all()
+        q7_now = read_q7(arm)
+    except Exception as e:
+        return {"success": False, "message": f"读取关节角失败: {e}"}
+
+    # 预放置点（目标上方 PRE_GRASP_Z）
+    pre_place = pos_world.copy()
+    pre_place[2] += PRE_GRASP_Z
+
+    # IK 求解预放置点
+    result_pre, q7_pre = ik(pre_place, q7_now)
+    if not result_pre.success:
+        pre_err = result_pre.pos_errors.get('right', float('inf'))
+        return {"success": False,
+                "message": f"预放置点 IK 失败（误差 {pre_err:.1f}mm）: {result_pre.message}"}
+
+    # 执行运动序列：移到盘子上方 → 松开夹爪 → 撤离（不下降到盘子表面）
+    try:
+        # 1. 移动到预放置点（盘子上方 PRE_GRASP_Z）
+        move_joints(xarm, arm, q7_pre, duration=3.0)
+        hold(xarm, arm, 0.5)
+
+        # 2. 在上方松开夹爪，物体自然落入盘子
+        gripper_open(xarm, gripper)
+        hold(xarm, arm, 0.8)
+
+        # 3. 抬起撤离
+        move_joints(xarm, arm, q7_pre, duration=1.5)
+        hold(xarm, arm, 0.5)
+
+    except Exception as e:
+        return {"success": False, "message": f"运动执行失败: {e}"}
+
+    pre_err_mm = float(result_pre.pos_errors.get('right', 0))
+    return {
+        "success": True,
+        "message": f"放置完成（在目标上方 {PRE_GRASP_Z*100:.0f}cm 释放）。预放置IK误差={pre_err_mm:.1f}mm",
+        "ik": {
+            "pre_place": {
+                "q_rad": q7_pre.astype(float).tolist(),
+                "q_deg": np.degrees(q7_pre).astype(float).tolist(),
+                "pos_error_mm": pre_err_mm,
             },
         },
     }

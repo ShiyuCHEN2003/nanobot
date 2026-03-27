@@ -23,8 +23,10 @@ MASTER_IDS = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07]
 SLAVE_IDS  = [0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17]
 
 # ── 各关节 PD 增益 ──
-KP = [300.0, 300.0, 150.0, 150.0, 40.0, 40.0, 30.0]
-KD = [  2.5,   2.5,   2.5,   2.5,  0.8,  0.8,  0.8]
+# 由 pid_sweep_test.py 扫描得出（KP_scale=1.50, KD_scale=2.00，综合得分最优）
+# 原始值：KP=[300,300,150,150,40,40,30], KD=[2.5,2.5,2.5,2.5,0.8,0.8,0.8]
+KP = [50.0, 50.0, 50.0, 50.0, 10.0, 10.0, 10.0]
+KD = [1.2, 1.2, 1.2, 1.2, 0.3, 0.2, 0.3]
 
 # ── 关节限位 (rad) ──
 JOINT_LIMITS = [
@@ -67,7 +69,7 @@ def _clip_q7(q7: np.ndarray) -> np.ndarray:
 
 
 def move_joints(xarm, arm, q7_target: np.ndarray,
-                duration: float = 3.0, n_steps: int = 300):
+                duration: float = 3.0, n_steps: int = 600):
     """
     从当前位置插值运动到 q7_target (rad)。
 
@@ -94,6 +96,38 @@ def move_joints(xarm, arm, q7_target: np.ndarray,
         xarm.recv_all()
         time.sleep(dt)
 
+# def move_to_initial_position(
+#     ctrl:    XArmController,
+#     channel: str,
+#     steps:   int = 220,
+#     step_ms: int = 10,
+# ) -> None:
+#     """线性插值 + PD 控制，平滑移动到 INIT_POS，总时长约 2.2 s。"""
+#     kp = [50.0, 50.0, 50.0, 50.0, 10.0, 10.0, 10.0]
+#     kd = [ 1.2,  1.2,  1.2,  1.2,  0.3,  0.2,  0.3]
+
+#     ctrl.recv_all(channel=channel, timeout=0.05)
+#     all_pos = ctrl.get_positions(channel)
+#     n       = min(len(all_pos), len(INIT_POS))   # 只控制臂关节（忽略多余电机如夹爪）
+#     start   = all_pos[:n]
+
+#     fmt = lambda v: f"{v:.3f}"
+#     print(f"[INFO] {channel} 移动至初始位置（{steps * step_ms / 1000:.1f} s）...")
+#     print(f"[INFO]   起始: [{', '.join(map(fmt, start))}]")
+#     print(f"[INFO]   目标: [{', '.join(map(fmt, INIT_POS))}]")
+
+#     # 若总线上有额外电机（如夹爪），额外生成保持当前位置的参数
+#     extra = [MITParam(kp=5.0, kd=0.5, q=all_pos[i]) for i in range(n, len(all_pos))]
+
+#     for step in range(steps):
+#         alpha  = (step + 1) / steps
+#         pos    = [start[i] * (1 - alpha) + INIT_POS[i] * alpha for i in range(n)]
+#         params = [MITParam(kp=kp[i], kd=kd[i], q=pos[i]) for i in range(n)] + extra
+#         ctrl.mit_control_all(channel, params)
+#         time.sleep(step_ms / 1000.0)
+#         ctrl.recv_all(channel=channel, timeout=0.005)
+
+#     print(f"[INFO] {channel} 已到达初始位置。")
 
 def hold(xarm, arm, duration: float = 0.5):
     """原地保持当前姿态。"""

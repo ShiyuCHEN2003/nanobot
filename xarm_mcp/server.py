@@ -166,6 +166,34 @@ async def list_tools() -> list[types.Tool]:
                 },
             },
         ),
+        types.Tool(
+            name="place_object",
+            description=(
+                "执行机械臂放置：将夹爪中的物体放到指定位置。传入 world_xyz 直接放置到已知坐标；传入 target 名称则感知目标位置后放置。"
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "world_xyz": {
+                        "type": "array",
+                        "items": {"type": "number"},
+                        "description": "放置目标位置3D世界坐标 [x, y, z]，单位米（如盘子中心）。",
+                    },
+                    "target": {
+                        "type": "string",
+                        "description": "放置目标名称（中/英文），如'盘子'、'plate'、'box'。未知坐标时使用。",
+                    },
+                    "canport": {
+                        "type": "string",
+                        "description": "CAN总线端口（默认 can2）",
+                    },
+                    "conf": {
+                        "type": "number",
+                        "description": "YOLO-World 检测置信度阈值（默认 0.1），仅在未传 world_xyz 时使用",
+                    },
+                },
+            },
+        ),
     ]
 
 
@@ -410,6 +438,102 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
             f"目标: {best['label']} (置信度 {best['confidence']:.0%})\n"
             f"世界坐标: {pos_cm}\n"
             f"{_format_grasp_result(result)}"
+        ))]
+
+    elif name == "place_object":
+        import base64
+        import openai
+        import httpx
+        from xarm_mcp.grasp_utils import match_target, execute_place
+
+        target = arguments.get("target", "")
+        canport = arguments.get("canport", "can2")
+        conf = arguments.get("conf", 0.05)
+        world_xyz = arguments.get("world_xyz")
+
+        if world_xyz is not None:
+            # ── 直接放置模式 ──
+            xyz = list(world_xyz)
+            pos_cm = f"({xyz[0]*100:.1f}, {xyz[1]*100:.1f}, {xyz[2]*100:.1f}) cm"
+            result = await asyncio.to_thread(execute_place, xyz, canport)
+            status = "成功" if result["success"] else "失败"
+            return [types.TextContent(type="text", text=(
+                f"放置{status}\n"
+                f"目标: {target or '未指定'}\n"
+                f"世界坐标: {pos_cm}\n"
+                f"详情: {result.get('message', '')}"
+            ))]
+
+        # ── 感知+放置模式 ──
+        cap_data = await asyncio.to_thread(_run, _ros2_snapshot_cmd(DEFAULT_IMAGE_CHEST))
+        if "error" in cap_data:
+            return [types.TextContent(type="text", text=f"放置失败 - 拍照错误: {cap_data['error']}")]
+        depth_path = cap_data.get("depth", DEFAULT_DEPTH_CHEST)
+
+        with open(DEFAULT_IMAGE_CHEST, "rb") as f:
+            img_b64 = base64.b64encode(f.read()).decode()
+        client = openai.AsyncOpenAI(
+            api_key=_get_moonshot_key(),
+            base_url="https://api.moonshot.cn/v1",
+            http_client=httpx.AsyncClient(proxy=None, trust_env=False),
+        )
+        response = await client.chat.completions.create(
+            model="moonshot-v1-8k-vision-preview",
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image_url",
+                     "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
+                    {"type": "text",
+                     "text": (
+                         "列出图片中所有可以用来放置物体的容器或平面（如盘子、碗、桌面、盒子）。"
+                         "只回答逗号分隔的英文名称列表，不要其他内容。"
+                         "例如：plate, bowl, tray"
+                     )},
+                ],
+            }],
+            max_tokens=100,
+        )
+        vision_text = response.choices[0].message.content.strip()
+        labels = [l.strip().strip(".,。，") for l in vision_text.replace("\n", ",").split(",") if l.strip()]
+        if target:
+            labels = [target] + labels
+        labels = list(dict.fromkeys(labels))
+
+        det_cmd = [
+            NANOBOT_PYTHON, str(SCRIPT), "detect_world_offline",
+            "--image", DEFAULT_IMAGE_CHEST,
+            "--depth", depth_path,
+            "--labels", ",".join(labels),
+            "--model", DEFAULT_MODEL_WORLD,
+            "--conf", str(conf),
+            "--calib-dir", CALIB_DIR,
+        ]
+        det_data = await asyncio.to_thread(_run, det_cmd)
+        if "error" in det_data:
+            return [types.TextContent(type="text",
+                text=f"放置失败 - 检测错误: {det_data['error']}")]
+
+        detections = det_data.get("detections", [])
+        if not detections:
+            return [types.TextContent(type="text",
+                text=f"放置失败 - 未检测到放置目标\n(Vision看到: {vision_text})")]
+
+        best = match_target(detections, target)
+        if best is None:
+            detected_names = ", ".join(d["label"] for d in detections)
+            return [types.TextContent(type="text",
+                text=f"放置失败 - 未找到目标 '{target}'\n检测到: {detected_names}")]
+
+        xyz = best["world_xyz_m"]
+        pos_cm = f"({xyz[0]*100:.1f}, {xyz[1]*100:.1f}, {xyz[2]*100:.1f}) cm"
+        result = await asyncio.to_thread(execute_place, xyz, canport)
+        status = "成功" if result["success"] else "失败"
+        return [types.TextContent(type="text", text=(
+            f"放置{status}\n"
+            f"目标: {best['label']} (置信度 {best['confidence']:.0%})\n"
+            f"世界坐标: {pos_cm}\n"
+            f"详情: {result.get('message', '')}"
         ))]
 
     else:

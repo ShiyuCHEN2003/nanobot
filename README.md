@@ -1790,6 +1790,113 @@ nanobot/
 └── cli/            # 🖥️ Commands
 ```
 
+## 🦾 XArm Robot Arm Integration
+
+nanobot integrates with the XArm 7-DOF robot arm via MCP tools and Skills, enabling natural-language grasping.
+
+### System Requirements
+
+- ROS2 Humble
+- Intel RealSense D435 (chest camera, RGB + depth)
+- XArm connected via CAN bus (`can2` by default)
+- `librealsense2`, `ros-humble-realsense2-camera`, `multi_realsense` ROS2 package
+
+### One-time Setup: CAN sudo permissions
+
+The CAN interface setup requires `sudo ip link`. Add a passwordless whitelist so the agent can configure CAN without prompting:
+
+```bash
+sudo tee /etc/sudoers.d/can-setup << 'EOF'
+vlai-minipc ALL=(ALL) NOPASSWD: /usr/sbin/ip link set can* down, /usr/sbin/ip link set can* type can *, /usr/sbin/ip link set can* up
+EOF
+sudo chmod 440 /etc/sudoers.d/can-setup
+```
+
+### Starting the Robot System
+
+Tell the agent to start the robot:
+
+```
+start robot
+启动机械臂
+```
+
+The `xarm-startup` skill will:
+1. Configure CAN interfaces (can0–can3, CAN-FD 1Mbps/5Mbps)
+2. Detect connected RealSense cameras
+3. Launch ROS2 camera nodes (`multi_cameras.launch.py auto_detect:=true`)
+
+**Startup is successful only when all three topics are visible:**
+
+```bash
+source /opt/ros/humble/setup.bash && ros2 topic list | grep cam
+# Expected:
+# /cam_chest/cam_chest/color/image_raw
+# /cam_chest/cam_chest/depth/image_rect_raw
+# /cam_chest/cam_chest/aligned_depth_to_color/image_raw
+```
+
+Only `color/image_raw` without depth topics means the system has **not** started successfully.
+
+### Grasping Objects
+
+```
+帮我抓杯子
+grasp the bottle
+抓一个东西
+```
+
+The `xarm-grasp` skill runs the full pipeline:
+
+```
+analyze_scene_chest()          # capture → Kimi Vision → YOLO-World → 3D coords
+  └─ grasp_object(world_xyz)   # IK solve → pre-grasp → descend → close gripper → lift
+```
+
+### Available MCP Tools
+
+| Tool | Description |
+|------|-------------|
+| `analyze_scene_chest` | Capture RGB+depth → Kimi Vision scene understanding → YOLO-World localization → 3D world coordinates |
+| `grasp_object` | Execute grasp. Pass `world_xyz` to skip perception, or `target` name to auto-perceive |
+| `detect_objects` | YOLOv8 detection on wrist camera image (pixel coords only) |
+| `capture_image_chest` | Capture a single frame from the chest RealSense |
+
+### Available Skills
+
+| Skill | Trigger | Description |
+|-------|---------|-------------|
+| `xarm-startup` | "启动机械臂", "start robot" | Configure CAN + start ROS2 cameras |
+| `xarm-home` | "回零位", "home pose" | Move arm to `[0, 0, 0, 60, 0, 0, 0]` degrees |
+| `xarm-grasp` | "抓取", "grasp", "pick up" | Full perceive-and-grasp workflow |
+
+### 3D Coordinate Pipeline
+
+```
+YOLO-World pixel (u, v)
+  + depth.npy (aligned depth, uint16 mm)
+  + calib/calib_chest.json (fx, fy, cx, cy)
+  → camera-frame point
+  + calib/calib_handeye_chest.json (T_cam_base, 18-frame optimization, std < 0.007mm)
+  → world_xyz in robot base frame (meters)
+```
+
+### Project Structure
+
+```
+xarm_mcp/
+├── server.py              # MCP server — exposes tools to the agent
+├── grasp_utils.py         # match_target(), execute_grasp(), IK solver
+├── arm_control.py         # Low-level CAN motor control
+├── camera_detect.py       # YOLO / YOLO-World detection + 3D projection
+├── ros2_snapshot.py       # Grab one RGB+depth frame from ROS2 topics
+├── calib/
+│   ├── calib_chest.json         # RealSense D435 intrinsics (serial 314422070707)
+│   └── calib_handeye_chest.json # Hand-eye extrinsics T_cam_base / T_base_cam
+└── ik/
+    └── xarm_ik_solver.py  # MuJoCo-based IK with multi-seed search
+```
+
 ## 🤝 Contribute & Roadmap
 
 PRs welcome! The codebase is intentionally small and readable. 🤗
