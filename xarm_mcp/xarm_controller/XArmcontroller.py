@@ -33,6 +33,7 @@ XArmController —— 达妙电机控制器模块
 """
 
 import can
+import math
 import time
 import sys
 from dataclasses import dataclass, field
@@ -66,12 +67,28 @@ LIMIT_GRIPPER = LIMIT_DM4310   # 根据实际型号调整
 # 含夹爪的 8 自由度配置（7 个臂关节 + 1 个夹爪）
 ARM_8DOF_LIMITS: List[List[float]] = ARM_7DOF_LIMITS + [LIMIT_GRIPPER]
 
+# XArm v10 七关节运动范围限位 (rad)，格式：(lower, upper)
+# 关节1-2: DM8009 肩部，关节3-4: DM4340 肘部，关节5-7: DM4310 腕部
+ARM_7DOF_JOINT_LIMITS: List[tuple] = [
+    (-math.radians(80),  math.radians(200)),   # J1 肩旋
+    (-math.radians(10),  math.radians(190)),   # J2 肩仰
+    (-math.radians(90),  math.radians(90)),    # J3 肘旋
+    ( math.radians(0),   math.radians(140)),   # J4 肘仰
+    (-math.radians(90),  math.radians(90)),    # J5 腕旋
+    (-math.radians(45),  math.radians(45)),    # J6 腕仰
+    (-math.radians(90),  math.radians(90)),    # J7 腕转
+]
+
 # 从机 CAN ID 和主机 ID（主机 ID = 从机 ID + 0x10）
 ARM_SLAVE_IDS  = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07]
 ARM_MASTER_IDS = [sid + 0x10 for sid in ARM_SLAVE_IDS]
 
 ARM_8DOF_SLAVE_IDS  = ARM_SLAVE_IDS  + [0x08]
 ARM_8DOF_MASTER_IDS = ARM_MASTER_IDS + [0x18]
+
+# 夹爪标定位置 (rad)
+GRIPPER_OPEN  = -math.radians(50)  # 张开角度（机械限位约 -60°）
+GRIPPER_CLOSE = 0.0                # 闭合角度
 
 
 # ===================== 数据结构 =====================

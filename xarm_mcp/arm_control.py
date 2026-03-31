@@ -1,63 +1,64 @@
 """
-右臂运动控制工具模块。
+右臂运动控制工具模块（基于 XArmController）。
 
 提供：
-  - build_arm(canport)          → (xarm, arm, gripper)
-  - read_q7(arm)                → np.ndarray (7,) 当前关节角 rad
-  - move_joints(xarm, arm, q7_target, duration)  插值运动到目标关节角
-  - gripper_open(xarm, gripper)
-  - gripper_close(xarm, gripper)
+  - build_arm(canport)          → ctrl (XArmController)
+  - read_q7(ctrl, canport)      → np.ndarray (7,) 当前关节角 rad
+  - move_joints(ctrl, q7_target, duration, canport)  插值运动到目标关节角
+  - gripper_open(ctrl, canport)
+  - gripper_close(ctrl, canport)
 """
 
+import os
+import sys
 import time
-import numpy as np
-import xarm_can as oa
 
-# ── 电机配置 ──
-MOTOR_TYPES = [
-    oa.MotorType.DM8009, oa.MotorType.DM8009,
-    oa.MotorType.DM4340, oa.MotorType.DM4340,
-    oa.MotorType.DM4310, oa.MotorType.DM4310, oa.MotorType.DM4310,
-]
-MASTER_IDS = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07]
-SLAVE_IDS  = [0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17]
+import numpy as np
+
+from xarm_mcp.xarm_controller.XArmcontroller import (
+    XArmController,
+    MITParam,
+    ARM_7DOF_JOINT_LIMITS,
+    ARM_8DOF_LIMITS,
+    ARM_8DOF_SLAVE_IDS,
+    ARM_8DOF_MASTER_IDS,
+    GRIPPER_OPEN,
+    GRIPPER_CLOSE,
+)
+
+CANPORT = "can2"
 
 # ── 各关节 PD 增益 ──
 # 由 pid_sweep_test.py 扫描得出（KP_scale=1.50, KD_scale=2.00，综合得分最优）
 # 原始值：KP=[300,300,150,150,40,40,30], KD=[2.5,2.5,2.5,2.5,0.8,0.8,0.8]
-KP = [50.0, 50.0, 50.0, 50.0, 10.0, 10.0, 10.0]
-KD = [1.2, 1.2, 1.2, 1.2, 0.3, 0.2, 0.3]
+# KP = [50.0, 50.0, 50.0, 50.0, 10.0, 10.0, 10.0]
+# KD = [1.2, 1.2, 1.2, 1.2, 0.3, 0.2, 0.3]
+KP = [300,300,150,150,40,40,30]
+KD = [2.5,2.5,2.5,2.5,0.8,0.8,0.8]
+# ── 关节限位 (rad)，从 XArmcontroller 统一维护 ──
+JOINT_LIMITS = ARM_7DOF_JOINT_LIMITS
 
-# ── 关节限位 (rad) ──
-JOINT_LIMITS = [
-    (np.deg2rad(-80),  np.deg2rad(200)),
-    (np.deg2rad(-10),  np.deg2rad(190)),
-    (np.deg2rad(-90),  np.deg2rad(90)),
-    (np.deg2rad(0),    np.deg2rad(140)),
-    (np.deg2rad(-90),  np.deg2rad(90)),
-    (np.deg2rad(-45),  np.deg2rad(45)),
-    (np.deg2rad(-90),  np.deg2rad(90)),
-]
+# ── 夹爪参数 ──
+GRIPPER_KP = 50.0
+GRIPPER_KD = 1.0
 
 
-def build_arm(canport: str = "can2"):
-    """初始化机械臂，返回 (xarm, arm, gripper)。"""
-    xarm = oa.XArm(canport, True)
-    xarm.init_arm_motors(MOTOR_TYPES, MASTER_IDS, SLAVE_IDS)
-    xarm.init_gripper_motor(oa.MotorType.DM4310, 0x08, 0x18)
-    xarm.set_callback_mode_all(oa.CallbackMode.STATE)
-    xarm.enable_all()
+def build_arm(canport: str = CANPORT) -> XArmController:
+    """初始化机械臂，返回 XArmController。"""
+    ctrl = XArmController(
+        {canport: ARM_8DOF_LIMITS},
+        slave_ids=ARM_8DOF_SLAVE_IDS,
+        master_ids=ARM_8DOF_MASTER_IDS,
+    )
+    ctrl.enable_all()
     time.sleep(0.1)
-    xarm.refresh_all()
-    xarm.recv_all()
-    arm     = xarm.get_arm()
-    gripper = xarm.get_gripper()
-    return xarm, arm, gripper
+    ctrl.recv_all(canport, timeout=0.05)
+    return ctrl
 
 
-def read_q7(arm) -> np.ndarray:
+def read_q7(ctrl: XArmController, canport: str = CANPORT) -> np.ndarray:
     """读取 7 个关节当前角度 (rad)。"""
-    return np.array([m.get_position() for m in arm.get_motors()])
+    return np.array(ctrl.get_positions(canport)[:7])
 
 
 def _clip_q7(q7: np.ndarray) -> np.ndarray:
@@ -68,33 +69,34 @@ def _clip_q7(q7: np.ndarray) -> np.ndarray:
     return q
 
 
-def move_joints(xarm, arm, q7_target: np.ndarray,
-                duration: float = 3.0, n_steps: int = 600):
-    """
-    从当前位置插值运动到 q7_target (rad)。
+def _arm_params(q7: np.ndarray, gripper_q: float) -> list:
+    """构建 8 个 MITParam：7 个臂关节 + 1 个夹爪保持。"""
+    params = [
+        MITParam(kp=KP[j], kd=KD[j], q=float(q7[j]))
+        for j in range(7)
+    ]
+    params.append(MITParam(kp=GRIPPER_KP, kd=GRIPPER_KD, q=float(gripper_q)))
+    return params
 
-    Parameters
-    ----------
-    xarm       : XArm 对象
-    arm        : ArmComponent 对象
-    q7_target  : 目标关节角，shape (7,)，rad
-    duration   : 运动时间，秒
-    n_steps    : 插值步数
-    """
-    xarm.refresh_all()
-    xarm.recv_all()
-    q0 = read_q7(arm)
-    q1 = _clip_q7(q7_target)
+
+def move_joints(ctrl: XArmController, q7_target: np.ndarray,
+                duration: float = 3.0, n_steps: int = 600,
+                canport: str = CANPORT):
+    """从当前位置线性插值运动到 q7_target (rad)。"""
+    ctrl.recv_all(canport, timeout=0.05)
+    all_pos = ctrl.get_positions(canport)
+    q0  = np.array(all_pos[:7])
+    q1  = _clip_q7(q7_target)
+    g_q = all_pos[7]   # 保持夹爪当前位置
 
     dt = duration / n_steps
     for i in range(n_steps + 1):
         alpha = i / n_steps
         q = q0 + (q1 - q0) * alpha
-        params = [oa.MITParam(KP[j], KD[j], float(q[j]), 0.0, 0.0)
-                  for j in range(7)]
-        arm.mit_control_all(params)
-        xarm.recv_all()
+        ctrl.mit_control_all(canport, _arm_params(q, g_q))
+        
         time.sleep(dt)
+        ctrl.recv_all(canport, timeout=0.005)
 
 # def move_to_initial_position(
 #     ctrl:    XArmController,
@@ -128,46 +130,27 @@ def move_joints(xarm, arm, q7_target: np.ndarray,
 #         ctrl.recv_all(channel=channel, timeout=0.005)
 
 #     print(f"[INFO] {channel} 已到达初始位置。")
-
-def hold(xarm, arm, duration: float = 0.5):
-    """原地保持当前姿态。"""
-    xarm.refresh_all()
-    xarm.recv_all()
-    q = read_q7(arm)
-    t_end = time.time() + duration
-    while time.time() < t_end:
-        params = [oa.MITParam(KP[j], KD[j], float(q[j]), 0.0, 0.0)
-                  for j in range(7)]
-        arm.mit_control_all(params)
-        xarm.recv_all()
-        time.sleep(0.005)
-
-
-GRIPPER_KP   = 10.0
-GRIPPER_KD   = 0.9
-GRIPPER_OPEN  = np.deg2rad(-50)  # 张开角度（机械限位约 -60°）
-GRIPPER_CLOSE = np.deg2rad(0)    # 闭合角度
-
-
-def _gripper_move(xarm, gripper, target_q: float, duration: float = 1.0, n_steps: int = 100):
+    
+def _gripper_move(ctrl: XArmController, target_q: float,
+                  duration: float = 1.0, n_steps: int = 100,
+                  canport: str = CANPORT):
     """插值运动夹爪到目标角度。"""
-    xarm.refresh_all()
-    xarm.recv_all()
-    q0 = gripper.get_motors()[0].get_position()
+    ctrl.recv_all(canport, timeout=0.05)
+    g0 = ctrl.get_gripper_position(canport)
     dt = duration / n_steps
     for i in range(n_steps + 1):
         alpha = i / n_steps
-        q = q0 + (target_q - q0) * alpha
-        gripper.mit_control_all([oa.MITParam(GRIPPER_KP, GRIPPER_KD, float(q), 0.0, 0.0)])
-        xarm.recv_all()
+        gq = g0 + (target_q - g0) * alpha
+        ctrl.gripper_position_control(canport, gq)
+        ctrl.recv_all(canport, timeout=0.005)
         time.sleep(dt)
 
 
-def gripper_open(xarm, gripper):
+def gripper_open(ctrl: XArmController, canport: str = CANPORT):
     """张开夹爪。"""
-    _gripper_move(xarm, gripper, GRIPPER_OPEN, duration=1.0)
+    _gripper_move(ctrl, GRIPPER_OPEN, duration=1.0, canport=canport)
 
 
-def gripper_close(xarm, gripper):
+def gripper_close(ctrl: XArmController, canport: str = CANPORT):
     """闭合夹爪（轻力夹取）。"""
-    _gripper_move(xarm, gripper, GRIPPER_CLOSE, duration=1.0)
+    _gripper_move(ctrl, GRIPPER_CLOSE, duration=1.0, canport=canport)

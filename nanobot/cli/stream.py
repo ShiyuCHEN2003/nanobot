@@ -26,7 +26,7 @@ class ThinkingSpinner:
 
     def __init__(self, console: Console | None = None):
         c = console or _make_console()
-        self._spinner = c.status("[dim]nanobot is thinking...[/dim]", spinner="dots")
+        self._spinner = c.status("[dim]bot is thinking...[/dim]", spinner="dots")
         self._active = False
 
     def __enter__(self):
@@ -98,7 +98,7 @@ class StreamRenderer:
             self._stop_spinner()
             c = _make_console()
             c.print()
-            c.print(f"[cyan]{__logo__} nanobot[/cyan]")
+            c.print(f"[cyan]bot[/cyan]")
             self._live = Live(self._render(), console=c, auto_refresh=False)
             self._live.start()
         now = time.monotonic()

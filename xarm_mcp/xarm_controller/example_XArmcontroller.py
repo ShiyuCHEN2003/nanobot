@@ -12,7 +12,7 @@ import threading
 import sys
 import numpy as np
 
-from XArmcontroller import (
+from xarm_mcp.xarm_controller.XArmcontroller import (
     XArmController,
     MITParam,
     ARM_7DOF_LIMITS,

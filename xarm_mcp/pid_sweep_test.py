@@ -18,11 +18,16 @@ import csv
 import itertools
 
 import numpy as np
-import xarm_can as oa
 
 # 将 xarm_mcp 目录加入路径（直接执行时需要）
 sys.path.insert(0, os.path.dirname(__file__))
-from arm_control import build_arm, read_q7, _clip_q7, JOINT_LIMITS, KP, KD
+from arm_control import build_arm, read_q7, _clip_q7, JOINT_LIMITS, KP, KD, GRIPPER_KP, GRIPPER_KD
+
+try:
+    from xarm_mcp.xarm_controller.XArmcontroller import MITParam
+except ImportError:
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "xarm_controller"))
+    from XArmcontroller import MITParam  # type: ignore
 
 # ── 测试路径点 (度) ──────────────────────────────────────────────────────
 #   各关节限位：J1[-80,200] J2[-10,190] J3[-90,90] J4[0,140] J5[-90,90] J6[-45,45] J7[-90,90]
@@ -75,7 +80,16 @@ CSV_FIELDS  = (["kp_scale", "kd_scale", "status",
 # 辅助函数
 # ─────────────────────────────────────────────────────────────────────────────
 
-def move_and_record(xarm, arm, q_start: np.ndarray, q_end: np.ndarray,
+def _make_params(q7: np.ndarray, kp_vec: np.ndarray, kd_vec: np.ndarray,
+                 gripper_q: float) -> list:
+    """构建 8 个 MITParam（7 臂 + 1 夹爪保持）。"""
+    params = [MITParam(kp=float(kp_vec[j]), kd=float(kd_vec[j]), q=float(q7[j]))
+              for j in range(7)]
+    params.append(MITParam(kp=GRIPPER_KP, kd=GRIPPER_KD, q=float(gripper_q)))
+    return params
+
+
+def move_and_record(ctrl, q_start: np.ndarray, q_end: np.ndarray,
                     kp_vec: np.ndarray, kd_vec: np.ndarray,
                     duration: float = DURATION, n_steps: int = N_STEPS):
     """
@@ -89,9 +103,9 @@ def move_and_record(xarm, arm, q_start: np.ndarray, q_end: np.ndarray,
     ------
     RuntimeError  — 任意关节误差超过 MAX_ERR_RAD
     """
-    xarm.refresh_all()
-    xarm.recv_all()
+    ctrl.recv_all(CANPORT, timeout=0.05)
     q_end_clipped = _clip_q7(q_end)
+    g_q = ctrl.get_positions(CANPORT)[7]   # 夹爪保持当前位置
     dt = duration / n_steps
     records = []
 
@@ -99,13 +113,10 @@ def move_and_record(xarm, arm, q_start: np.ndarray, q_end: np.ndarray,
         alpha = i / n_steps
         q_tgt = q_start + (q_end_clipped - q_start) * alpha
 
-        params = [oa.MITParam(float(kp_vec[j]), float(kd_vec[j]),
-                              float(q_tgt[j]), 0.0, 0.0)
-                  for j in range(7)]
-        arm.mit_control_all(params)
-        xarm.recv_all()
+        ctrl.mit_control_all(CANPORT, _make_params(q_tgt, kp_vec, kd_vec, g_q))
+        ctrl.recv_all(CANPORT, timeout=0.005)
 
-        q_act = read_q7(arm)
+        q_act = read_q7(ctrl, CANPORT)
 
         # 安全检查
         err = np.abs(q_act - q_tgt)
@@ -123,22 +134,19 @@ def move_and_record(xarm, arm, q_start: np.ndarray, q_end: np.ndarray,
     return records
 
 
-def hold_position(xarm, arm, kp_vec: np.ndarray, kd_vec: np.ndarray,
+def hold_position(ctrl, kp_vec: np.ndarray, kd_vec: np.ndarray,
                   duration: float = HOLD_SECS):
     """原地保持（使用测试增益），捕获保持阶段的数据。"""
-    xarm.refresh_all()
-    xarm.recv_all()
-    q = read_q7(arm)
+    ctrl.recv_all(CANPORT, timeout=0.05)
+    q = read_q7(ctrl, CANPORT)
+    g_q = ctrl.get_positions(CANPORT)[7]
     dt = 0.005
     t_end = time.time() + duration
     records = []
     while time.time() < t_end:
-        params = [oa.MITParam(float(kp_vec[j]), float(kd_vec[j]),
-                              float(q[j]), 0.0, 0.0)
-                  for j in range(7)]
-        arm.mit_control_all(params)
-        xarm.recv_all()
-        q_act = read_q7(arm)
+        ctrl.mit_control_all(CANPORT, _make_params(q, kp_vec, kd_vec, g_q))
+        ctrl.recv_all(CANPORT, timeout=0.005)
+        q_act = read_q7(ctrl, CANPORT)
         records.append({"q_actual": q_act.copy(),
                          "q_target": q.copy(),
                          "dt": dt})
@@ -182,7 +190,7 @@ def compute_metrics(records: list) -> dict:
     return result
 
 
-def run_trial(xarm, arm, kp_scale: float, kd_scale: float) -> dict:
+def run_trial(ctrl, kp_scale: float, kd_scale: float) -> dict:
     """
     执行一组完整试验：
       基准归位 → HOME → POSE_A → POSE_B → POSE_C → HOME
@@ -193,21 +201,21 @@ def run_trial(xarm, arm, kp_scale: float, kd_scale: float) -> dict:
 
     # 步骤 1：用基准增益安全归位（防止上轮残余振荡）
     print("    归位（基准增益）...", end=" ", flush=True)
-    q_now = read_q7(arm)
-    move_and_record(xarm, arm, q_now, HOME_RAD,
+    q_now = read_q7(ctrl, CANPORT)
+    move_and_record(ctrl, q_now, HOME_RAD,
                     np.array(KP), np.array(KD), duration=4.0)
     time.sleep(0.2)
     print("完成")
 
     # 步骤 2：按顺序经过所有路径点（测试增益）
     all_records = []
-    q_now = read_q7(arm)
+    q_now = read_q7(ctrl, CANPORT)
     for wp, name in zip(WAYPOINTS, WAYPOINT_NAMES):
         print(f"    → {name} ...", end=" ", flush=True)
-        recs = move_and_record(xarm, arm, q_now, wp, kp_vec, kd_vec)
-        rec_hold = hold_position(xarm, arm, kp_vec, kd_vec, HOLD_SECS)
+        recs = move_and_record(ctrl, q_now, wp, kp_vec, kd_vec)
+        rec_hold = hold_position(ctrl, kp_vec, kd_vec, HOLD_SECS)
         all_records.extend(recs + rec_hold)
-        q_now = read_q7(arm)
+        q_now = read_q7(ctrl, CANPORT)
         print("完成")
 
     metrics = compute_metrics(all_records)
@@ -281,12 +289,12 @@ def print_summary(results: list):
 
 def main():
     print("初始化机械臂...")
-    xarm, arm, gripper = build_arm(CANPORT)
+    ctrl = build_arm(CANPORT)
 
     # 先用基准增益运动到 home
     print("运动到初始位置（基准增益）...")
-    q_now = read_q7(arm)
-    move_and_record(xarm, arm, q_now, HOME_RAD,
+    q_now = read_q7(ctrl, CANPORT)
+    move_and_record(ctrl, q_now, HOME_RAD,
                     np.array(KP), np.array(KD), duration=5.0, n_steps=1000)
     time.sleep(0.5)
 
@@ -299,7 +307,7 @@ def main():
     for idx, (kp_s, kd_s) in enumerate(grid):
         print(f"[{idx+1:02d}/{total}] KP_scale={kp_s:.2f}  KD_scale={kd_s:.2f}")
         try:
-            metrics = run_trial(xarm, arm, kp_s, kd_s)
+            metrics = run_trial(ctrl, kp_s, kd_s)
             print(f"    ✓ 综合={metrics['combined_score']:.4f}  "
                   f"抖动={metrics['jitter_rad_s2']:.4f} r/s²  "
                   f"RMS={np.rad2deg(metrics['rms_error_rad']):.3f}°")

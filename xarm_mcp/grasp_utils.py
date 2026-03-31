@@ -107,15 +107,14 @@ def get_arm_resources(canport: str = CANPORT_DEFAULT):
     """懒初始化机械臂和 IK 求解器（进程内只执行一次）。"""
     global _arm_state, _ik_fn
     if _arm_state is None:
-        from xarm_mcp.arm_control import build_arm, move_joints, hold, gripper_open, gripper_close
-        xarm, arm, gripper = build_arm(canport)
-        move_joints(xarm, arm, np.deg2rad(INIT_Q7_DEG), duration=3.0)
+        from xarm_mcp.arm_control import build_arm, move_joints, gripper_open, gripper_close
+        ctrl = build_arm(canport)
+        move_joints(ctrl, np.deg2rad(INIT_Q7_DEG), duration=3.0, canport=canport)
         if INIT_GRIPPER_DEG <= -10:
-            gripper_open(xarm, gripper)
+            gripper_open(ctrl, canport)
         else:
-            gripper_close(xarm, gripper)
-        hold(xarm, arm, duration=0.3)
-        _arm_state = {"xarm": xarm, "arm": arm, "gripper": gripper}
+            gripper_close(ctrl, canport)
+        _arm_state = {"ctrl": ctrl, "canport": canport}
     if _ik_fn is None:
         _ik_fn = _build_ik()
     return _arm_state, _ik_fn
@@ -174,30 +173,27 @@ def execute_grasp(world_xyz, canport: str = CANPORT_DEFAULT) -> dict:
             }
         }
     """
-    from xarm_mcp.arm_control import read_q7, move_joints, hold, gripper_close, gripper_open
+    from xarm_mcp.arm_control import read_q7, move_joints, gripper_close, gripper_open
 
     try:
         arm_state, ik = get_arm_resources(canport)
     except Exception as e:
         return {"success": False, "message": f"机械臂初始化失败: {e}"}
 
-    xarm = arm_state["xarm"]
-    arm = arm_state["arm"]
-    gripper = arm_state["gripper"]
+    ctrl = arm_state["ctrl"]
+    cp   = arm_state["canport"]
 
     pos_world = np.array(world_xyz, dtype=float)
 
     # 张开夹爪
     try:
-        gripper_open(xarm, gripper)
+        gripper_open(ctrl, cp)
     except Exception as e:
         return {"success": False, "message": f"夹爪张开失败: {e}"}
 
     # 读取当前关节角
     try:
-        xarm.refresh_all()
-        xarm.recv_all()
-        q7_now = read_q7(arm)
+        q7_now = read_q7(ctrl, cp)
     except Exception as e:
         return {"success": False, "message": f"读取关节角失败: {e}"}
 
@@ -222,19 +218,16 @@ def execute_grasp(world_xyz, canport: str = CANPORT_DEFAULT) -> dict:
     # 执行运动序列
     try:
         # 1. 移动到预抓取点（目标上方）
-        move_joints(xarm, arm, q7_pre, duration=3.0)
-        hold(xarm, arm, 0.5)
+        move_joints(ctrl, q7_pre, duration=3.0, canport=cp)
 
         # 2. 下降到抓取点
-        move_joints(xarm, arm, q7_grasp, duration=2.0)
-        hold(xarm, arm, 0.3)
+        move_joints(ctrl, q7_grasp, duration=2.0, canport=cp)
 
         # 3. 夹爪闭合
-        gripper_close(xarm, gripper)
+        gripper_close(ctrl, cp)
 
         # 4. 抬起（回到预抓取点）
-        move_joints(xarm, arm, q7_pre, duration=2.0)
-        hold(xarm, arm, 1.0)
+        move_joints(ctrl, q7_pre, duration=2.0, canport=cp)
 
     except Exception as e:
         return {"success": False, "message": f"运动执行失败: {e}"}
@@ -278,24 +271,21 @@ def execute_place(world_xyz, canport: str = CANPORT_DEFAULT) -> dict:
     Returns:
         {"success": bool, "message": str, "ik": {...}}
     """
-    from xarm_mcp.arm_control import read_q7, move_joints, hold, gripper_open
+    from xarm_mcp.arm_control import read_q7, move_joints, gripper_open
 
     try:
         arm_state, ik = get_arm_resources(canport)
     except Exception as e:
         return {"success": False, "message": f"机械臂初始化失败: {e}"}
 
-    xarm = arm_state["xarm"]
-    arm = arm_state["arm"]
-    gripper = arm_state["gripper"]
+    ctrl = arm_state["ctrl"]
+    cp   = arm_state["canport"]
 
     pos_world = np.array(world_xyz, dtype=float)
 
     # 读取当前关节角
     try:
-        xarm.refresh_all()
-        xarm.recv_all()
-        q7_now = read_q7(arm)
+        q7_now = read_q7(ctrl, cp)
     except Exception as e:
         return {"success": False, "message": f"读取关节角失败: {e}"}
 
@@ -313,16 +303,13 @@ def execute_place(world_xyz, canport: str = CANPORT_DEFAULT) -> dict:
     # 执行运动序列：移到盘子上方 → 松开夹爪 → 撤离（不下降到盘子表面）
     try:
         # 1. 移动到预放置点（盘子上方 PRE_GRASP_Z）
-        move_joints(xarm, arm, q7_pre, duration=3.0)
-        hold(xarm, arm, 0.5)
+        move_joints(ctrl, q7_pre, duration=3.0, canport=cp)
 
         # 2. 在上方松开夹爪，物体自然落入盘子
-        gripper_open(xarm, gripper)
-        hold(xarm, arm, 0.8)
+        gripper_open(ctrl, cp)
 
         # 3. 抬起撤离
-        move_joints(xarm, arm, q7_pre, duration=1.5)
-        hold(xarm, arm, 0.5)
+        move_joints(ctrl, q7_pre, duration=1.5, canport=cp)
 
     except Exception as e:
         return {"success": False, "message": f"运动执行失败: {e}"}
