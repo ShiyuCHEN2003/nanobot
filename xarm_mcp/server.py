@@ -45,6 +45,7 @@ DEFAULT_MODEL = os.environ.get("YOLO_MODEL", "yolov8n.pt")
 DEFAULT_MODEL_WORLD = str(Path(__file__).parent.parent / "yolov8s-world.pt")
 CALIB_DIR = str(Path(__file__).parent / "calib")
 DEFAULT_DEPTH_CHEST = "/tmp/nanobot_chest_depth.npy"
+ARM_CANPORT = "can2"
 
 
 def _get_moonshot_key() -> str:
@@ -146,6 +147,41 @@ def _run(cmd: list[str], timeout: int = 120) -> dict:
         return {"error": f"bad output: {result.stdout.strip()}"}
 
 
+async def _perceive_target(target: str) -> tuple[list, str] | tuple[None, str]:
+    """拍照 → Vision 识别 → 返回 (detections, error_msg)。
+    成功时 error_msg 为空字符串；失败时 detections 为 None。
+    """
+    import base64
+    cap_data = await asyncio.to_thread(_run, _ros2_snapshot_cmd(DEFAULT_IMAGE_CHEST))
+    if "error" in cap_data:
+        return None, f"拍照失败: {cap_data['error']}"
+    depth_path = cap_data.get("depth", DEFAULT_DEPTH_CHEST)
+    with open(DEFAULT_IMAGE_CHEST, "rb") as f:
+        img_b64 = base64.b64encode(f.read()).decode()
+    vision_raw, detections = await _vision_detect(img_b64, depth_path, hint=target)
+    if not detections:
+        return None, f"未检测到任何物体（Vision看到: {vision_raw}）"
+    return detections, ""
+
+
+def _format_grasp_result(result: dict) -> str:
+    lines = [f"详情: {result.get('message', '')}"]
+    ik = result.get("ik")
+    if not isinstance(ik, dict):
+        return "\n".join(lines)
+    pre   = ik.get("pre_grasp", {})
+    grasp = ik.get("grasp", {})
+    if isinstance(pre.get("q_deg"), list):
+        lines.append("预抓取关节角(deg): " + ", ".join(f"{v:.1f}" for v in pre["q_deg"]))
+    if isinstance(grasp.get("q_deg"), list):
+        lines.append("抓取点关节角(deg): " + ", ".join(f"{v:.1f}" for v in grasp["q_deg"]))
+    if pre.get("pos_error_mm") is not None:
+        lines.append(f"预抓取IK误差: {float(pre['pos_error_mm']):.1f} mm")
+    if grasp.get("pos_error_mm") is not None:
+        lines.append(f"抓取点IK误差: {float(grasp['pos_error_mm']):.1f} mm")
+    return "\n".join(lines)
+
+
 @app.list_tools()
 async def list_tools() -> list[types.Tool]:
     return [
@@ -217,10 +253,6 @@ async def list_tools() -> list[types.Tool]:
                         "type": "string",
                         "description": "目标物体名称（中/英文），如'杯子'、'cup'、'bottle'。未知坐标时使用，留空则抓置信度最高的物体。",
                     },
-                    "canport": {
-                        "type": "string",
-                        "description": "CAN总线端口（默认 can2）",
-                    },
                     "conf": {
                         "type": "number",
                         "description": "YOLO-World 检测置信度阈值（默认 0.1），仅在未传 world_xyz 时使用",
@@ -244,10 +276,6 @@ async def list_tools() -> list[types.Tool]:
                     "target": {
                         "type": "string",
                         "description": "放置目标名称（中/英文），如'盘子'、'plate'、'box'。未知坐标时使用。",
-                    },
-                    "canport": {
-                        "type": "string",
-                        "description": "CAN总线端口（默认 can2）",
                     },
                     "conf": {
                         "type": "number",
@@ -315,159 +343,60 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         data = _run(_ros2_snapshot_cmd(DEFAULT_IMAGE_CHEST))
         return [types.TextContent(type="text", text=json.dumps(data))]
 
-    elif name == "detect_objects_chest":
-        conf = arguments.get("conf", 0.4)
-        # 先从 ROS2 话题抓取一帧（不直接启动相机）
-        cap_data = _run(_ros2_snapshot_cmd(DEFAULT_IMAGE_CHEST))
-        if "error" in cap_data:
-            return [types.TextContent(type="text", text=json.dumps(cap_data))]
-        # 再检测
-        det_cmd = [NANOBOT_PYTHON, str(SCRIPT), "detect",
-                   "--image", DEFAULT_IMAGE_CHEST,
-                   "--model", DEFAULT_MODEL, "--conf", str(conf)]
-        data = _run(det_cmd)
-        if "detections" in data:
-            lines = [f"胸部相机检测到 {len(data['detections'])} 个物体:"]
-            for d in data["detections"]:
-                x1, y1, x2, y2 = d["bbox"]
-                lines.append(
-                    f"  - {d['label']} ({d['confidence']:.0%})  bbox:[{x1:.0f},{y1:.0f},{x2:.0f},{y2:.0f}]"
-                )
-            return [types.TextContent(type="text", text="\n".join(lines))]
-        return [types.TextContent(type="text", text=json.dumps(data))]
-
     elif name == "grasp_object":
-        import base64
         from xarm_mcp.grasp_utils import match_target, execute_grasp
 
-        target = arguments.get("target", "")
-        canport = arguments.get("canport", "can2")
-        world_xyz = arguments.get("world_xyz")  # 已知坐标时直接跳过感知
+        target    = arguments.get("target", "")
+        world_xyz = arguments.get("world_xyz")
 
-        def _format_grasp_result(result: dict) -> str:
-            lines = [f"详情: {result.get('message', '')}"]
-            ik = result.get("ik")
-            if not isinstance(ik, dict):
-                return "\n".join(lines)
+        if world_xyz is None:
+            detections, err = await _perceive_target(target)
+            if detections is None:
+                return [types.TextContent(type="text", text=f"抓取失败 - {err}")]
+            best = match_target(detections, target)
+            if best is None:
+                names = ", ".join(d["label"] for d in detections)
+                return [types.TextContent(type="text",
+                    text=f"抓取失败 - 未找到目标 '{target}'\n检测到的物体: {names}")]
+            world_xyz = best["world_xyz_m"]
+            label = f"{best['label']} (置信度 {best['confidence']:.0%})"
+        else:
+            label = target or "未指定"
 
-            pre = ik.get("pre_grasp", {})
-            grasp = ik.get("grasp", {})
-            pre_deg = pre.get("q_deg")
-            grasp_deg = grasp.get("q_deg")
-            pre_err = pre.get("pos_error_mm")
-            grasp_err = grasp.get("pos_error_mm")
-
-            if isinstance(pre_deg, list):
-                lines.append("预抓取关节角(deg): " + ", ".join(f"{v:.1f}" for v in pre_deg))
-            if isinstance(grasp_deg, list):
-                lines.append("抓取点关节角(deg): " + ", ".join(f"{v:.1f}" for v in grasp_deg))
-            if pre_err is not None:
-                lines.append(f"预抓取IK误差: {float(pre_err):.1f} mm")
-            if grasp_err is not None:
-                lines.append(f"抓取点IK误差: {float(grasp_err):.1f} mm")
-            return "\n".join(lines)
-
-        if world_xyz is not None:
-            # ── 直接抓取模式：跳过感知 ──
-            xyz = list(world_xyz)
-            pos_cm = f"({xyz[0]*100:.1f}, {xyz[1]*100:.1f}, {xyz[2]*100:.1f}) cm"
-            result = await asyncio.to_thread(execute_grasp, xyz, canport)
-            status = "成功" if result["success"] else "失败"
-            return [types.TextContent(type="text", text=(
-                f"抓取{status}\n"
-                f"目标: {target or '未指定'}\n"
-                f"世界坐标: {pos_cm}\n"
-                f"{_format_grasp_result(result)}"
-            ))]
-
-        # ── 感知+抓取模式：拍照识别再抓取 ──
-
-        # 1a. 采集 RGB + depth
-        cap_data = await asyncio.to_thread(_run, _ros2_snapshot_cmd(DEFAULT_IMAGE_CHEST))
-        if "error" in cap_data:
-            return [types.TextContent(type="text", text=f"抓取失败 - 拍照错误: {cap_data['error']}")]
-        depth_path = cap_data.get("depth", DEFAULT_DEPTH_CHEST)
-
-        # 1b. Vision → bbox → 3D
-        with open(DEFAULT_IMAGE_CHEST, "rb") as f:
-            img_b64 = base64.b64encode(f.read()).decode()
-        vision_raw, detections = await _vision_detect(img_b64, depth_path, hint=target)
-
-        if not detections:
-            return [types.TextContent(type="text",
-                text=f"抓取失败 - 未检测到任何物体\n(Vision看到: {vision_raw})")]
-
-        # ── 目标匹配 ──
-        best = match_target(detections, target)
-        if best is None:
-            detected_names = ", ".join(d["label"] for d in detections)
-            return [types.TextContent(type="text",
-                text=f"抓取失败 - 未找到目标 '{target}'\n检测到的物体: {detected_names}")]
-
-        xyz = best["world_xyz_m"]
+        xyz    = list(world_xyz)
         pos_cm = f"({xyz[0]*100:.1f}, {xyz[1]*100:.1f}, {xyz[2]*100:.1f}) cm"
-
-        # ── 执行抓取 ──
-        result = await asyncio.to_thread(execute_grasp, xyz, canport)
-
+        result = await asyncio.to_thread(execute_grasp, xyz, ARM_CANPORT)
         status = "成功" if result["success"] else "失败"
         return [types.TextContent(type="text", text=(
-            f"抓取{status}\n"
-            f"目标: {best['label']} (置信度 {best['confidence']:.0%})\n"
-            f"世界坐标: {pos_cm}\n"
-            f"{_format_grasp_result(result)}"
+            f"抓取{status}\n目标: {label}\n世界坐标: {pos_cm}\n{_format_grasp_result(result)}"
         ))]
 
     elif name == "place_object":
-        import base64
         from xarm_mcp.grasp_utils import match_target, execute_place
 
-        target = arguments.get("target", "")
-        canport = arguments.get("canport", "can2")
+        target    = arguments.get("target", "")
         world_xyz = arguments.get("world_xyz")
 
-        if world_xyz is not None:
-            # ── 直接放置模式 ──
-            xyz = list(world_xyz)
-            pos_cm = f"({xyz[0]*100:.1f}, {xyz[1]*100:.1f}, {xyz[2]*100:.1f}) cm"
-            result = await asyncio.to_thread(execute_place, xyz, canport)
-            status = "成功" if result["success"] else "失败"
-            return [types.TextContent(type="text", text=(
-                f"放置{status}\n"
-                f"目标: {target or '未指定'}\n"
-                f"世界坐标: {pos_cm}\n"
-                f"详情: {result.get('message', '')}"
-            ))]
+        if world_xyz is None:
+            detections, err = await _perceive_target(target)
+            if detections is None:
+                return [types.TextContent(type="text", text=f"放置失败 - {err}")]
+            best = match_target(detections, target)
+            if best is None:
+                names = ", ".join(d["label"] for d in detections)
+                return [types.TextContent(type="text",
+                    text=f"放置失败 - 未找到目标 '{target}'\n检测到: {names}")]
+            world_xyz = best["world_xyz_m"]
+            label = best["label"]
+        else:
+            label = target or "未指定"
 
-        # ── 感知+放置模式 ──
-        cap_data = await asyncio.to_thread(_run, _ros2_snapshot_cmd(DEFAULT_IMAGE_CHEST))
-        if "error" in cap_data:
-            return [types.TextContent(type="text", text=f"放置失败 - 拍照错误: {cap_data['error']}")]
-        depth_path = cap_data.get("depth", DEFAULT_DEPTH_CHEST)
-
-        with open(DEFAULT_IMAGE_CHEST, "rb") as f:
-            img_b64 = base64.b64encode(f.read()).decode()
-        vision_raw, detections = await _vision_detect(img_b64, depth_path, hint=target)
-
-        if not detections:
-            return [types.TextContent(type="text",
-                text=f"放置失败 - 未检测到放置目标\n(Vision看到: {vision_raw})")]
-
-        best = match_target(detections, target)
-        if best is None:
-            detected_names = ", ".join(d["label"] for d in detections)
-            return [types.TextContent(type="text",
-                text=f"放置失败 - 未找到目标 '{target}'\n检测到: {detected_names}")]
-
-        xyz = best["world_xyz_m"]
+        xyz    = list(world_xyz)
         pos_cm = f"({xyz[0]*100:.1f}, {xyz[1]*100:.1f}, {xyz[2]*100:.1f}) cm"
-        result = await asyncio.to_thread(execute_place, xyz, canport)
+        result = await asyncio.to_thread(execute_place, xyz, ARM_CANPORT)
         status = "成功" if result["success"] else "失败"
         return [types.TextContent(type="text", text=(
-            f"放置{status}\n"
-            f"目标: {best['label']}\n"
-            f"世界坐标: {pos_cm}\n"
-            f"详情: {result.get('message', '')}"
+            f"放置{status}\n目标: {label}\n世界坐标: {pos_cm}\n详情: {result.get('message', '')}"
         ))]
 
     else:

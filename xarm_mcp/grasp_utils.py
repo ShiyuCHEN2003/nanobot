@@ -52,8 +52,8 @@ _arm_state = None   # {"xarm": ..., "arm": ..., "gripper": ...}
 _ik_fn = None       # ik() callable
 
 
-def _build_ik():
-    """构建 IK 求解器（从 grasp_pipeline.py 提取，无需修改逻辑）。"""
+def build_ik():
+    """构建 IK 求解器。"""
     from xarm_mcp.ik.xarm_ik_solver import XarmIKSolver
 
     solver = XarmIKSolver(
@@ -119,7 +119,7 @@ def get_arm_resources(canport: str = CANPORT_DEFAULT):
             arm.gripper_close()
         _arm_state = {"arm": arm}
     if _ik_fn is None:
-        _ik_fn = _build_ik()
+        _ik_fn = build_ik()
     return _arm_state, _ik_fn
 
 
