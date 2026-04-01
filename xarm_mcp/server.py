@@ -105,7 +105,9 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="analyze_scene_chest",
             description=(
-                "胸部相机感知：拍照 → Kimi Vision 识别场景 → YOLO-World 定位 → 返回每个物体的3D世界坐标（相对机械臂基坐标系，单位米）。"
+                "【主要感知工具】拍照 → 视觉AI识别所有物体 → YOLO-World精确定位 → 返回每个物体的名称、置信度和3D世界坐标（相对机械臂基坐标系，单位米）。"
+                "用户问'你能看到什么'、'有哪些物体'、'坐标是多少'时必须调用此工具。"
+                "抓取前也必须先调用此工具获取坐标。"
             ),
             inputSchema={
                 "type": "object",
@@ -223,7 +225,7 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         import base64
         import openai
 
-        conf = arguments.get("conf", 0.05)
+        conf = arguments.get("conf", 0.03)
         extra_labels = arguments.get("extra_labels", [])
 
         # 1. 采集 RGB + depth（从 ROS2 /cam_chest topic）
@@ -251,8 +253,9 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
                     {"type": "text",
                      "text": (
                          "列出图片中所有可以被机械臂抓取的物体。"
-                         "只回答逗号分隔的英文名称列表，不要其他内容。"
-                         "例如：apple, plastic bottle, wooden block"
+                         "用英文名称，必须包含颜色和形状描述（如 green block, pink plate, red cup）。"
+                         "只回答逗号分隔的列表，不要其他内容。"
+                         "例如：green block, pink plate, black cable, brown box"
                      )},
                 ],
             }],
@@ -264,6 +267,7 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         labels = [l.strip().strip(".,。，") for l in vision_text.replace("\n", ",").split(",") if l.strip()]
         labels += extra_labels
         labels = list(dict.fromkeys(labels))  # 去重保序
+
 
         # 4. YOLO-World 检测 + 3D 坐标（离线，不重开相机）
         det_cmd = [
@@ -388,8 +392,9 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
                     {"type": "text",
                      "text": (
                          "列出图片中所有可以被机械臂抓取的物体。"
-                         "只回答逗号分隔的英文名称列表，不要其他内容。"
-                         "例如：apple, plastic bottle, wooden block"
+                         "用英文名称，必须包含颜色和形状描述（如 green block, pink plate, red cup）。"
+                         "只回答逗号分隔的列表，不要其他内容。"
+                         "例如：green block, pink plate, black cable, brown box"
                      )},
                 ],
             }],
@@ -398,6 +403,7 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         vision_text = response.choices[0].message.content.strip()
         labels = [l.strip().strip(".,。，") for l in vision_text.replace("\n", ",").split(",") if l.strip()]
         labels = list(dict.fromkeys(labels))
+
 
         # 1c. YOLO-World 检测 + 3D 坐标（离线，不重开相机）
         det_cmd = [
@@ -499,6 +505,7 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         if target:
             labels = [target] + labels
         labels = list(dict.fromkeys(labels))
+
 
         det_cmd = [
             NANOBOT_PYTHON, str(SCRIPT), "detect_world_offline",

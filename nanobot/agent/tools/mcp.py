@@ -126,6 +126,21 @@ class MCPToolWrapper(Tool):
             )
             return f"(MCP tool call failed: {type(exc).__name__})"
 
+        has_image = any(isinstance(block, types.ImageContent) for block in result.content)
+        if has_image:
+            content_blocks = []
+            for block in result.content:
+                if isinstance(block, types.TextContent):
+                    content_blocks.append({"type": "text", "text": block.text})
+                elif isinstance(block, types.ImageContent):
+                    content_blocks.append({
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{block.mimeType};base64,{block.data}"},
+                    })
+                else:
+                    content_blocks.append({"type": "text", "text": str(block)})
+            return content_blocks or [{"type": "text", "text": "(no output)"}]
+
         parts = []
         for block in result.content:
             if isinstance(block, types.TextContent):
