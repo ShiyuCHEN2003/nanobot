@@ -31,10 +31,10 @@ CANPORT = "can2"
 # ── 各关节 PD 增益 ──
 # 由 pid_sweep_test.py 扫描得出（KP_scale=1.50, KD_scale=2.00，综合得分最优）
 # 原始值：KP=[300,300,150,150,40,40,30], KD=[2.5,2.5,2.5,2.5,0.8,0.8,0.8]
-# KP = [50.0, 50.0, 50.0, 50.0, 10.0, 10.0, 10.0]
-# KD = [1.2, 1.2, 1.2, 1.2, 0.3, 0.2, 0.3]
-KP = [300,300,150,150,40,40,30]
-KD = [2.5,2.5,2.5,2.5,0.8,0.8,0.8]
+KP = [50.0, 50.0, 50.0, 50.0, 10.0, 10.0, 10.0]
+KD = [ 1.2,  1.2,  1.2,  1.2,  0.3,  0.2,  0.3]
+# KP = [300,300,150,150,40,40,30]
+# KD = [2.5,2.5,2.5,2.5,0.8,0.8,0.8]
 # ── 关节限位 (rad)，从 XArmcontroller 统一维护 ──
 JOINT_LIMITS = ARM_7DOF_JOINT_LIMITS
 
@@ -69,10 +69,12 @@ def _clip_q7(q7: np.ndarray) -> np.ndarray:
     return q
 
 
-def _arm_params(q7: np.ndarray, gripper_q: float) -> list:
+def _arm_params(q7: np.ndarray, gripper_q: float,
+                tau_ff: np.ndarray = None) -> list:
     """构建 8 个 MITParam：7 个臂关节 + 1 个夹爪保持。"""
     params = [
-        MITParam(kp=KP[j], kd=KD[j], q=float(q7[j]))
+        MITParam(kp=KP[j], kd=KD[j], q=float(q7[j]),
+                 tau=float(tau_ff[j]) if tau_ff is not None else 0.0)
         for j in range(7)
     ]
     params.append(MITParam(kp=GRIPPER_KP, kd=GRIPPER_KD, q=float(gripper_q)))
@@ -80,21 +82,23 @@ def _arm_params(q7: np.ndarray, gripper_q: float) -> list:
 
 
 def move_joints(ctrl: XArmController, q7_target: np.ndarray,
-                duration: float = 3.0, n_steps: int = 600,
-                canport: str = CANPORT):
-    """从当前位置线性插值运动到 q7_target (rad)。"""
+                duration: float = 3.0, n_steps: int = 300,
+                canport: str = CANPORT, dynamics=None):
+    """从当前位置线性插值运动到 q7_target (rad)。
+    dynamics: 可选 ArmDynamics 实例，启用重力补偿前馈。
+    """
     ctrl.recv_all(canport, timeout=0.05)
     all_pos = ctrl.get_positions(canport)
     q0  = np.array(all_pos[:7])
     q1  = _clip_q7(q7_target)
-    g_q = all_pos[7]   # 保持夹爪当前位置
+    g_q = all_pos[7]
 
     dt = duration / n_steps
     for i in range(n_steps + 1):
         alpha = i / n_steps
         q = q0 + (q1 - q0) * alpha
-        ctrl.mit_control_all(canport, _arm_params(q, g_q))
-        
+        tau_ff = dynamics.get_gravity(q) if dynamics is not None else None
+        ctrl.mit_control_all(canport, _arm_params(q, g_q, tau_ff))
         time.sleep(dt)
         ctrl.recv_all(canport, timeout=0.005)
 

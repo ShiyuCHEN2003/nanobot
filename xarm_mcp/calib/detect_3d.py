@@ -14,7 +14,10 @@ Controls:
 import os, sys, json, time
 import numpy as np
 import cv2
-cv2.setLogLevel(0)
+try:
+    cv2.setLogLevel(0)
+except AttributeError:
+    pass
 import pyrealsense2 as rs
 from ultralytics import YOLO
 

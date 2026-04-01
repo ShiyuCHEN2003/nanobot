@@ -8,6 +8,10 @@ sys.path.insert(0, os.path.dirname(_HERE))
 
 from xarm_mcp.grasp_pipeline import build_ik
 from xarm_mcp.arm_control import build_arm, read_q7, move_joints, gripper_open, gripper_close
+from xarm_mcp.xarm_controller.gravity_comp import ArmDynamics
+
+URDF = os.path.join(_HERE, "xarm_controller", "xarm_bimanual.urdf")
+dyn  = ArmDynamics(URDF, "xarm_right_")
 
 CANPORT = "can2"
 PRE_GRASP_Z = 0.10   # 预抓取比目标高 10cm
@@ -44,23 +48,24 @@ if not result_grasp.success:
     print(f"抓取 IK 失败: {result_grasp.message}")
     ctrl.disable_all(); ctrl.close(); sys.exit(1)
 
-# print("\n张开夹爪...")
-# gripper_open(ctrl, CANPORT)
+print("\n张开夹爪...")
+gripper_open(ctrl, CANPORT)
 
-print("→ 移动到预抓取点")
-# move_joints(ctrl, q7_pre, canport=CANPORT)
+q7_j1only = np.zeros(7); q7_j1only[0] = q7_pre[0]
+print(f"→ 移动到预抓取点（仅J1）: {np.round(np.degrees(q7_j1only),1).tolist()} deg")
+move_joints(ctrl, q7_j1only, canport=CANPORT, dynamics=dyn)
 # time.sleep(SETTLE_SECS)
 
 print("→ 下降到抓取点")
-move_joints(ctrl, q7_grasp, canport=CANPORT)
-time.sleep(SETTLE_SECS)
+move_joints(ctrl, q7_grasp, canport=CANPORT, dynamics=dyn)
+# time.sleep(SETTLE_SECS)
 
-# print("→ 夹爪闭合")
-# gripper_close(ctrl, CANPORT)
+print("→ 夹爪闭合")
+gripper_close(ctrl, CANPORT)
 # time.sleep(SETTLE_SECS)
 
 # print("→ 抬起")
-# move_joints(ctrl, q7_pre, canport=CANPORT)
+move_joints(ctrl, q7_pre, canport=CANPORT, dynamics=dyn)
 # time.sleep(SETTLE_SECS)
 
 print("完成！")
