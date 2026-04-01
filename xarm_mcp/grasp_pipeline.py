@@ -36,9 +36,7 @@ sys.path.insert(0, _ROOT)
 
 from xarm_mcp.calib.detect_3d import load_calib, pixel_to_world, sample_depth
 from xarm_mcp.ik.xarm_ik_solver import XarmIKSolver
-from xarm_mcp.arm_control import (
-    build_arm, read_q7, move_joints, gripper_open, gripper_close
-)
+from xarm_mcp.arm_control import Arm
 
 SCENE_XML            = os.path.join(_HERE, "xml/scene.xml")
 YOLO_MODEL           = os.path.join(_ROOT, "yolov8n.pt")
@@ -140,8 +138,7 @@ def main():
     print("IK 就绪")
 
     print(f"初始化机械臂 (CAN: {args.canport})...")
-    ctrl = build_arm(args.canport)
-    canport = args.canport
+    arm = Arm(args.canport)
     print("机械臂就绪")
 
     # 启动相机
@@ -157,7 +154,7 @@ def main():
     print("相机就绪")
 
     print("张开夹爪...")
-    gripper_open(ctrl, canport)
+    arm.gripper_open()
     print("夹爪就绪")
 
     WIN = "抓取流水线  [SPACE] 执行抓取  [q] 退出"
@@ -220,7 +217,7 @@ def main():
                       f"{pos_world[2]*100:.1f}) cm")
 
                 # 当前关节角
-                q7_now = read_q7(ctrl, canport)
+                q7_now = arm.read_q7()
 
                 # 预抓取点（目标上方 PRE_GRASP_Z）
                 pre_grasp = pos_world.copy()
@@ -247,19 +244,19 @@ def main():
 
                 # 1. 运动到预抓取点
                 print("  → 移动到预抓取点")
-                move_joints(ctrl, q7_pre, duration=3.0, canport=canport)
+                arm.move_joints(q7_pre)
 
                 # 2. 下降到抓取点
                 print("  → 下降到抓取点")
-                move_joints(ctrl, q7_grasp, duration=2.0, canport=canport)
+                arm.move_joints(q7_grasp)
 
                 # 3. 夹爪闭合
                 print("  → 夹爪闭合")
-                gripper_close(ctrl, canport)
+                arm.gripper_close()
 
                 # 4. 抬起
                 print("  → 抬起")
-                move_joints(ctrl, q7_pre, duration=2.0, canport=canport)
+                arm.move_joints(q7_pre)
 
                 print("[抓取] 完成！\n")
 
@@ -269,8 +266,8 @@ def main():
     finally:
         pipeline.stop()
         cv2.destroyAllWindows()
-        ctrl.disable_all()
-        ctrl.close()
+        arm._ctrl.disable_all()
+        arm._ctrl.close()
 
 
 if __name__ == "__main__":

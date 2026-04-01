@@ -3,8 +3,7 @@
 import argparse
 import numpy as np
 
-from xarm_mcp.arm_control import build_arm, move_joints, read_q7, gripper_close
-import time
+from xarm_mcp.arm_control import Arm
 
 
 def main():
@@ -12,18 +11,16 @@ def main():
     parser.add_argument("--canport", default="can2")
     args = parser.parse_args()
 
-    q_deg = np.array([0.0, 20.0, 0.0, 60.0, 0.0, 0.0, 0.0], dtype=float)
     q_rad = np.deg2rad([0, 20, 0, 60, 0, 0, 0])
 
-    print("Target joints (deg):", q_deg.tolist())
-    ctrl = build_arm(args.canport)
-    move_joints(ctrl, q_rad,canport=args.canport)
-    # time.sleep(0.5)
+    print("Target joints (deg):", np.rad2deg(q_rad).tolist())
+    arm = Arm(args.canport)
+    arm.move_joints(q_rad)
 
     print("Closing gripper...")
-    gripper_close(ctrl, args.canport)
+    arm.gripper_close()
 
-    q_now = read_q7(ctrl, args.canport)
+    q_now = arm.read_q7()
     print("Current joints (deg):", np.round(np.rad2deg(q_now), 2).tolist())
     print("Gripper: closed (0 deg)")
 

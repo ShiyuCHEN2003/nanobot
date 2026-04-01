@@ -106,15 +106,18 @@ def _build_ik():
 def get_arm_resources(canport: str = CANPORT_DEFAULT):
     """懒初始化机械臂和 IK 求解器（进程内只执行一次）。"""
     global _arm_state, _ik_fn
+    if _arm_state is not None and _arm_state["arm"].canport != canport:
+        raise RuntimeError(
+            f"机械臂已在 {_arm_state['arm'].canport} 初始化，无法切换到 {canport}")
     if _arm_state is None:
-        from xarm_mcp.arm_control import build_arm, move_joints, gripper_open, gripper_close
-        ctrl = build_arm(canport)
-        move_joints(ctrl, np.deg2rad(INIT_Q7_DEG), duration=3.0, canport=canport)
+        from xarm_mcp.arm_control import Arm
+        arm = Arm(canport)
+        arm.move_joints(np.deg2rad(INIT_Q7_DEG))
         if INIT_GRIPPER_DEG <= -10:
-            gripper_open(ctrl, canport)
+            arm.gripper_open()
         else:
-            gripper_close(ctrl, canport)
-        _arm_state = {"ctrl": ctrl, "canport": canport}
+            arm.gripper_close()
+        _arm_state = {"arm": arm}
     if _ik_fn is None:
         _ik_fn = _build_ik()
     return _arm_state, _ik_fn
@@ -173,27 +176,24 @@ def execute_grasp(world_xyz, canport: str = CANPORT_DEFAULT) -> dict:
             }
         }
     """
-    from xarm_mcp.arm_control import read_q7, move_joints, gripper_close, gripper_open
-
     try:
         arm_state, ik = get_arm_resources(canport)
     except Exception as e:
         return {"success": False, "message": f"机械臂初始化失败: {e}"}
 
-    ctrl = arm_state["ctrl"]
-    cp   = arm_state["canport"]
+    arm = arm_state["arm"]
 
     pos_world = np.array(world_xyz, dtype=float)
 
     # 张开夹爪
     try:
-        gripper_open(ctrl, cp)
+        arm.gripper_open()
     except Exception as e:
         return {"success": False, "message": f"夹爪张开失败: {e}"}
 
     # 读取当前关节角
     try:
-        q7_now = read_q7(ctrl, cp)
+        q7_now = arm.read_q7()
     except Exception as e:
         return {"success": False, "message": f"读取关节角失败: {e}"}
 
@@ -218,16 +218,16 @@ def execute_grasp(world_xyz, canport: str = CANPORT_DEFAULT) -> dict:
     # 执行运动序列
     try:
         # 1. 移动到预抓取点（目标上方）
-        move_joints(ctrl, q7_pre, duration=3.0, canport=cp)
+        arm.move_joints(q7_pre)
 
         # 2. 下降到抓取点
-        move_joints(ctrl, q7_grasp, duration=2.0, canport=cp)
+        arm.move_joints(q7_grasp, duration=2.0)
 
         # 3. 夹爪闭合
-        gripper_close(ctrl, cp)
+        arm.gripper_close()
 
         # 4. 抬起（回到预抓取点）
-        move_joints(ctrl, q7_pre, duration=2.0, canport=cp)
+        arm.move_joints(q7_pre, duration=2.0)
 
     except Exception as e:
         return {"success": False, "message": f"运动执行失败: {e}"}
@@ -271,21 +271,18 @@ def execute_place(world_xyz, canport: str = CANPORT_DEFAULT) -> dict:
     Returns:
         {"success": bool, "message": str, "ik": {...}}
     """
-    from xarm_mcp.arm_control import read_q7, move_joints, gripper_open
-
     try:
         arm_state, ik = get_arm_resources(canport)
     except Exception as e:
         return {"success": False, "message": f"机械臂初始化失败: {e}"}
 
-    ctrl = arm_state["ctrl"]
-    cp   = arm_state["canport"]
+    arm = arm_state["arm"]
 
     pos_world = np.array(world_xyz, dtype=float)
 
     # 读取当前关节角
     try:
-        q7_now = read_q7(ctrl, cp)
+        q7_now = arm.read_q7()
     except Exception as e:
         return {"success": False, "message": f"读取关节角失败: {e}"}
 
@@ -303,13 +300,13 @@ def execute_place(world_xyz, canport: str = CANPORT_DEFAULT) -> dict:
     # 执行运动序列：移到盘子上方 → 松开夹爪 → 撤离（不下降到盘子表面）
     try:
         # 1. 移动到预放置点（盘子上方 PRE_GRASP_Z）
-        move_joints(ctrl, q7_pre, duration=3.0, canport=cp)
+        arm.move_joints(q7_pre)
 
         # 2. 在上方松开夹爪，物体自然落入盘子
-        gripper_open(ctrl, cp)
+        arm.gripper_open()
 
         # 3. 抬起撤离
-        move_joints(ctrl, q7_pre, duration=1.5, canport=cp)
+        arm.move_joints(q7_pre, duration=1.5)
 
     except Exception as e:
         return {"success": False, "message": f"运动执行失败: {e}"}
