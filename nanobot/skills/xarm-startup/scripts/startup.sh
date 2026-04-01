@@ -11,14 +11,33 @@ log() { echo "[$(date '+%H:%M:%S')] $*"; }
 die() { echo "ERROR: $*" >&2; exit 1; }
 
 # ── 1. CAN 接口配置 ──────────────────────────────────────────────
-log "配置 CAN 接口..."
-[ -f "$SETUP_CAN" ] || die "找不到 $SETUP_CAN"
-sudo bash "$SETUP_CAN"
+# 只在接口未 UP 或处于 BUS-OFF 状态时才重新配置
+_can_ok() {
+    local iface=$1
+    ip link show "$iface" 2>/dev/null | grep -q "LOWER_UP" || return 1   # 未 UP
+    ip -details link show "$iface" 2>/dev/null | grep -q "BUS-OFF" && return 1  # 总线错误
+    return 0
+}
 
-if ! ip link show | grep -q "can.*UP"; then
-    die "CAN 接口未成功启动，请检查硬件连接"
+CAN_NEEDS_SETUP=false
+for i in 0 1 2 3; do
+    if ! _can_ok "can$i"; then
+        CAN_NEEDS_SETUP=true
+        break
+    fi
+done
+
+if $CAN_NEEDS_SETUP; then
+    log "CAN 接口状态异常，重新配置..."
+    [ -f "$SETUP_CAN" ] || die "找不到 $SETUP_CAN"
+    sudo bash "$SETUP_CAN"
+    if ! ip link show | grep -q "can.*UP"; then
+        die "CAN 接口未成功启动，请检查硬件连接"
+    fi
+    log "CAN 接口配置完成"
+else
+    log "CAN 接口已就绪，跳过配置"
 fi
-log "CAN 接口就绪"
 
 # ── 2. 检测相机序列号 ─────────────────────────────────────────────
 log "检测 RealSense 相机序列号..."
@@ -34,11 +53,19 @@ log "检测到 $COUNT 个相机: $(echo $SERIALS | tr '\n' ' ')"
 SERIAL_CHEST=$(echo "$SERIALS" | head -1)
 log "胸部相机序列号: $SERIAL_CHEST"
 
-# ── 3. 启动 ROS2 相机节点（后台）──────────────────────────────────
-log "启动 ROS2 相机节点（后台）..."
+# ── 3. 启动 ROS2 相机节点（已在运行则跳过）──────────────────────
 source "$ROS_SETUP"
 
-# 杀掉旧的 launch 进程
+COLOR_OK=$(ros2 topic list 2>/dev/null | grep -c "cam_chest.*color/image_raw" || true)
+DEPTH_OK=$(ros2 topic list 2>/dev/null | grep -c "aligned_depth_to_color" || true)
+
+if [ "$COLOR_OK" -gt 0 ] && [ "$DEPTH_OK" -gt 0 ]; then
+    log "✅ 相机话题已就绪，跳过启动"
+    ros2 topic list 2>/dev/null | grep cam_chest
+    exit 0
+fi
+
+log "启动 ROS2 相机节点（后台）..."
 pkill -f "multi_cameras.launch.py" 2>/dev/null || true
 sleep 1
 

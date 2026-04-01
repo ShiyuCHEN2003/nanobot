@@ -200,22 +200,6 @@ async def list_tools() -> list[types.Tool]:
                 },
             },
         ),
-        # types.Tool(
-        #     name="detect_objects_chest",
-        #     description=(
-        #         "【备用】胸部相机 YOLOv8 检测，仅支持 COCO 80 类常见物体，只输出像素坐标无3D坐标。"
-        #         "优先使用 analyze_scene_chest，只有在 analyze_scene_chest 失败时才用此工具。"
-        #     ),
-        #     inputSchema={
-        #         "type": "object",
-        #         "properties": {
-        #             "conf": {
-        #                 "type": "number",
-        #                 "description": "Confidence threshold 0-1 (default: 0.4)",
-        #             },
-        #         },
-        #     },
-        # ),
         types.Tool(
             name="grasp_object",
             description=(
