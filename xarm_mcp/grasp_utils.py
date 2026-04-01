@@ -17,7 +17,7 @@ _ROOT = os.path.dirname(_HERE)
 
 SCENE_XML            = os.path.join(_HERE, "xml/scene.xml")
 RIGHT_ARM_QPOS_SLICE = slice(9, 16)
-PRE_GRASP_Z          = 0.10   # 预抓取点比目标高 10cm
+PRE_GRASP_Z          = 0.15  # 预抓取点比目标高 10cm
 CANPORT_DEFAULT      = "can2"
 INIT_Q7_DEG          = np.array([0, 20, 0, 60, 0, 0, 0], dtype=float)
 INIT_GRIPPER_DEG     = 0.0
@@ -221,13 +221,13 @@ def execute_grasp(world_xyz, canport: str = CANPORT_DEFAULT) -> dict:
         arm.move_joints(q7_pre)
 
         # 2. 下降到抓取点
-        arm.move_joints(q7_grasp, duration=2.0)
+        arm.move_joints(q7_grasp)
 
         # 3. 夹爪闭合
         arm.gripper_close()
 
         # 4. 抬起（回到预抓取点）
-        arm.move_joints(q7_pre, duration=2.0)
+        arm.move_joints(q7_pre)
 
     except Exception as e:
         return {"success": False, "message": f"运动执行失败: {e}"}
