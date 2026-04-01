@@ -59,6 +59,82 @@ def _get_moonshot_key() -> str:
 app = Server("xarm-wrist-camera")
 
 
+def _parse_vision_bboxes(raw: str) -> list[dict] | None:
+    """从 Vision 模型响应中提取 bbox JSON 列表，容忍 markdown 代码块包裹。"""
+    import re
+    text = raw.strip()
+    # 去掉 ```json ... ``` 或 ``` ... ```
+    m = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
+    if m:
+        text = m.group(1).strip()
+    # 找第一个 [ ... ]
+    m = re.search(r"\[[\s\S]*\]", text)
+    if m:
+        text = m.group(0)
+    try:
+        data = json.loads(text)
+        if isinstance(data, list):
+            return [
+                item for item in data
+                if isinstance(item, dict)
+                and "label" in item
+                and isinstance(item.get("bbox"), list)
+                and len(item["bbox"]) == 4
+            ]
+    except (json.JSONDecodeError, ValueError):
+        pass
+    return None
+
+
+async def _vision_detect(img_b64: str, depth_path: str, hint: str = "") -> tuple[str, list[dict]]:
+    """Kimi Vision 输出 bbox → bbox_to_3d 计算 3D 坐标。
+    返回 (vision_raw_text, detections列表)。
+    detections 每项: {label, bbox, depth_m, world_xyz_m}
+    """
+    import openai, httpx
+
+    extra = f"重点关注: {hint}。" if hint else ""
+    client = openai.AsyncOpenAI(
+        api_key=_get_moonshot_key(),
+        base_url="https://api.moonshot.cn/v1",
+        http_client=httpx.AsyncClient(proxy=None, trust_env=False),
+    )
+    response = await client.chat.completions.create(
+        model="moonshot-v1-8k-vision-preview",
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "image_url",
+                 "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
+                {"type": "text",
+                 "text": (
+                     f"检测图像中所有可被机械臂抓取的物体。{extra}"
+                     "图像尺寸为 640x480 像素。"
+                     "只返回 JSON 数组，不要任何其他文字，格式：\n"
+                     '[{"label":"颜色+英文名称","bbox":[x1,y1,x2,y2]}, ...]\n'
+                     '例：[{"label":"green block","bbox":[456,430,522,480]},'
+                     '{"label":"pink plate","bbox":[122,358,415,480]}]'
+                 )},
+            ],
+        }],
+        max_tokens=400,
+    )
+    vision_raw = response.choices[0].message.content.strip()
+    bboxes = _parse_vision_bboxes(vision_raw)
+    if not bboxes:
+        return vision_raw, []
+
+    det_cmd = [
+        NANOBOT_PYTHON, str(SCRIPT), "bbox_to_3d",
+        "--depth", depth_path,
+        "--bboxes", json.dumps(bboxes),
+        "--calib-dir", CALIB_DIR,
+    ]
+    det_data = await asyncio.to_thread(_run, det_cmd)
+    detections = det_data.get("detections", []) if "error" not in det_data else []
+    return vision_raw, detections
+
+
 def _run(cmd: list[str], timeout: int = 120) -> dict:
     """Run a subprocess command and return parsed JSON output."""
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
@@ -223,75 +299,32 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
 
     elif name == "analyze_scene_chest":
         import base64
-        import openai
 
-        conf = arguments.get("conf", 0.03)
         extra_labels = arguments.get("extra_labels", [])
+        hint = ", ".join(extra_labels) if extra_labels else ""
 
-        # 1. 采集 RGB + depth（从 ROS2 /cam_chest topic）
+        # 1. 采集 RGB + depth
         cap_data = await asyncio.to_thread(_run, _ros2_snapshot_cmd(DEFAULT_IMAGE_CHEST))
         if "error" in cap_data:
             return [types.TextContent(type="text", text=f"拍照失败: {cap_data['error']}")]
         depth_path = cap_data.get("depth", DEFAULT_DEPTH_CHEST)
 
-        # 2. Vision API 识别物体
+        # 2. Vision → bbox → 3D
         with open(DEFAULT_IMAGE_CHEST, "rb") as f:
             img_b64 = base64.b64encode(f.read()).decode()
-        import httpx
-        client = openai.AsyncOpenAI(
-            api_key=_get_moonshot_key(),
-            base_url="https://api.moonshot.cn/v1",
-            http_client=httpx.AsyncClient(proxy=None, trust_env=False),
-        )
-        response = await client.chat.completions.create(
-            model="moonshot-v1-8k-vision-preview",
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "image_url",
-                     "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
-                    {"type": "text",
-                     "text": (
-                         "列出图片中所有可以被机械臂抓取的物体。"
-                         "用英文名称，必须包含颜色和形状描述（如 green block, pink plate, red cup）。"
-                         "只回答逗号分隔的列表，不要其他内容。"
-                         "例如：green block, pink plate, black cable, brown box"
-                     )},
-                ],
-            }],
-            max_tokens=200,
-        )
-        vision_text = response.choices[0].message.content.strip()
+        vision_raw, detections = await _vision_detect(img_b64, depth_path, hint=hint)
 
-        # 3. 解析标签
-        labels = [l.strip().strip(".,。，") for l in vision_text.replace("\n", ",").split(",") if l.strip()]
-        labels += extra_labels
-        labels = list(dict.fromkeys(labels))  # 去重保序
-
-
-        # 4. YOLO-World 检测 + 3D 坐标（离线，不重开相机）
-        det_cmd = [
-            NANOBOT_PYTHON, str(SCRIPT), "detect_world_offline",
-            "--image", DEFAULT_IMAGE_CHEST,
-            "--depth", depth_path,
-            "--labels", ",".join(labels),
-            "--model", DEFAULT_MODEL_WORLD,
-            "--conf", str(conf),
-            "--calib-dir", CALIB_DIR,
-        ]
-        det_data = await asyncio.to_thread(_run, det_cmd)
-
-        # 5. 格式化输出
-        lines = [f"Vision 识别到: {vision_text}", ""]
-        if "error" in det_data:
-            lines.append(f"YOLO-World 失败: {det_data['error']}")
-        elif "detections" in det_data:
-            lines.append(f"YOLO-World 定位到 {len(det_data['detections'])} 个物体:")
-            for d in det_data["detections"]:
+        # 3. 格式化输出
+        lines = [f"Vision 识别到: {vision_raw}", ""]
+        if not detections:
+            lines.append("未能获取物体坐标（Vision 未返回有效 bbox）")
+        else:
+            lines.append(f"检测到 {len(detections)} 个物体:")
+            for d in detections:
                 xyz = d.get("world_xyz_m")
                 pos = (f"world=({xyz[0]*100:.1f}, {xyz[1]*100:.1f}, {xyz[2]*100:.1f}) cm"
                        if xyz else "无深度数据")
-                lines.append(f"  - {d['label']} ({d['confidence']:.0%})  depth={d['depth_m']*100:.1f}cm  {pos}")
+                lines.append(f"  - {d['label']}  depth={d['depth_m']*100:.1f}cm  {pos}")
         return [types.TextContent(type="text", text="\n".join(lines))]
 
     elif name == "capture_image_chest":
@@ -321,13 +354,10 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
 
     elif name == "grasp_object":
         import base64
-        import openai
-        import httpx
         from xarm_mcp.grasp_utils import match_target, execute_grasp
 
         target = arguments.get("target", "")
         canport = arguments.get("canport", "can2")
-        conf = arguments.get("conf", 0.05)
         world_xyz = arguments.get("world_xyz")  # 已知坐标时直接跳过感知
 
         def _format_grasp_result(result: dict) -> str:
@@ -368,62 +398,20 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
 
         # ── 感知+抓取模式：拍照识别再抓取 ──
 
-        # 1a. 采集 RGB + depth（从 ROS2 /cam_chest topic）
+        # 1a. 采集 RGB + depth
         cap_data = await asyncio.to_thread(_run, _ros2_snapshot_cmd(DEFAULT_IMAGE_CHEST))
         if "error" in cap_data:
             return [types.TextContent(type="text", text=f"抓取失败 - 拍照错误: {cap_data['error']}")]
         depth_path = cap_data.get("depth", DEFAULT_DEPTH_CHEST)
 
-        # 1b. Kimi Vision API 识别可抓取物体
+        # 1b. Vision → bbox → 3D
         with open(DEFAULT_IMAGE_CHEST, "rb") as f:
             img_b64 = base64.b64encode(f.read()).decode()
-        client = openai.AsyncOpenAI(
-            api_key=_get_moonshot_key(),
-            base_url="https://api.moonshot.cn/v1",
-            http_client=httpx.AsyncClient(proxy=None, trust_env=False),
-        )
-        response = await client.chat.completions.create(
-            model="moonshot-v1-8k-vision-preview",
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "image_url",
-                     "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
-                    {"type": "text",
-                     "text": (
-                         "列出图片中所有可以被机械臂抓取的物体。"
-                         "用英文名称，必须包含颜色和形状描述（如 green block, pink plate, red cup）。"
-                         "只回答逗号分隔的列表，不要其他内容。"
-                         "例如：green block, pink plate, black cable, brown box"
-                     )},
-                ],
-            }],
-            max_tokens=200,
-        )
-        vision_text = response.choices[0].message.content.strip()
-        labels = [l.strip().strip(".,。，") for l in vision_text.replace("\n", ",").split(",") if l.strip()]
-        labels = list(dict.fromkeys(labels))
+        vision_raw, detections = await _vision_detect(img_b64, depth_path, hint=target)
 
-
-        # 1c. YOLO-World 检测 + 3D 坐标（离线，不重开相机）
-        det_cmd = [
-            NANOBOT_PYTHON, str(SCRIPT), "detect_world_offline",
-            "--image", DEFAULT_IMAGE_CHEST,
-            "--depth", depth_path,
-            "--labels", ",".join(labels),
-            "--model", DEFAULT_MODEL_WORLD,
-            "--conf", str(conf),
-            "--calib-dir", CALIB_DIR,
-        ]
-        det_data = await asyncio.to_thread(_run, det_cmd)
-        if "error" in det_data:
-            return [types.TextContent(type="text",
-                text=f"抓取失败 - 检测错误: {det_data['error']}\n(Vision看到: {vision_text})")]
-
-        detections = det_data.get("detections", [])
         if not detections:
             return [types.TextContent(type="text",
-                text=f"抓取失败 - 未检测到任何物体\n(Vision看到: {vision_text})")]
+                text=f"抓取失败 - 未检测到任何物体\n(Vision看到: {vision_raw})")]
 
         # ── 目标匹配 ──
         best = match_target(detections, target)
@@ -448,13 +436,10 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
 
     elif name == "place_object":
         import base64
-        import openai
-        import httpx
         from xarm_mcp.grasp_utils import match_target, execute_place
 
         target = arguments.get("target", "")
         canport = arguments.get("canport", "can2")
-        conf = arguments.get("conf", 0.05)
         world_xyz = arguments.get("world_xyz")
 
         if world_xyz is not None:
@@ -478,53 +463,11 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
 
         with open(DEFAULT_IMAGE_CHEST, "rb") as f:
             img_b64 = base64.b64encode(f.read()).decode()
-        client = openai.AsyncOpenAI(
-            api_key=_get_moonshot_key(),
-            base_url="https://api.moonshot.cn/v1",
-            http_client=httpx.AsyncClient(proxy=None, trust_env=False),
-        )
-        response = await client.chat.completions.create(
-            model="moonshot-v1-8k-vision-preview",
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "image_url",
-                     "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
-                    {"type": "text",
-                     "text": (
-                         "列出图片中所有可以用来放置物体的容器或平面（如盘子、碗、桌面、盒子）。"
-                         "只回答逗号分隔的英文名称列表，不要其他内容。"
-                         "例如：plate, bowl, tray"
-                     )},
-                ],
-            }],
-            max_tokens=100,
-        )
-        vision_text = response.choices[0].message.content.strip()
-        labels = [l.strip().strip(".,。，") for l in vision_text.replace("\n", ",").split(",") if l.strip()]
-        if target:
-            labels = [target] + labels
-        labels = list(dict.fromkeys(labels))
+        vision_raw, detections = await _vision_detect(img_b64, depth_path, hint=target)
 
-
-        det_cmd = [
-            NANOBOT_PYTHON, str(SCRIPT), "detect_world_offline",
-            "--image", DEFAULT_IMAGE_CHEST,
-            "--depth", depth_path,
-            "--labels", ",".join(labels),
-            "--model", DEFAULT_MODEL_WORLD,
-            "--conf", str(conf),
-            "--calib-dir", CALIB_DIR,
-        ]
-        det_data = await asyncio.to_thread(_run, det_cmd)
-        if "error" in det_data:
-            return [types.TextContent(type="text",
-                text=f"放置失败 - 检测错误: {det_data['error']}")]
-
-        detections = det_data.get("detections", [])
         if not detections:
             return [types.TextContent(type="text",
-                text=f"放置失败 - 未检测到放置目标\n(Vision看到: {vision_text})")]
+                text=f"放置失败 - 未检测到放置目标\n(Vision看到: {vision_raw})")]
 
         best = match_target(detections, target)
         if best is None:
@@ -538,7 +481,7 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         status = "成功" if result["success"] else "失败"
         return [types.TextContent(type="text", text=(
             f"放置{status}\n"
-            f"目标: {best['label']} (置信度 {best['confidence']:.0%})\n"
+            f"目标: {best['label']}\n"
             f"世界坐标: {pos_cm}\n"
             f"详情: {result.get('message', '')}"
         ))]

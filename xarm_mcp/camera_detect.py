@@ -86,6 +86,54 @@ def detect_world_offline(args):
     print(_json.dumps({"detections": detections}))
 
 
+def bbox_to_3d(args):
+    """将 Vision 模型输出的 bbox JSON + depth 图转换为 3D 世界坐标。
+    不依赖 YOLO，直接用 Vision 模型的定位结果。
+    """
+    import numpy as np
+
+    calib_dir = args.calib_dir or os.path.join(os.path.dirname(os.path.abspath(__file__)), "calib")
+    with open(os.path.join(calib_dir, "calib_chest.json")) as f:
+        cc = json.load(f)
+    with open(os.path.join(calib_dir, "calib_handeye_chest.json")) as f:
+        hc = json.load(f)
+    K          = np.array(cc["K"],          dtype=np.float64)
+    T_base_cam = np.array(hc["T_base_cam"], dtype=np.float64)
+
+    depth_raw = np.load(args.depth)   # uint16 mm, shape (H, W)
+
+    def _pixel_to_world(u, v, depth_m):
+        fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+        p_cam = np.array([(u - cx) * depth_m / fx,
+                          (v - cy) * depth_m / fy,
+                          depth_m, 1.0])
+        return (T_base_cam @ p_cam)[:3]
+
+    def _sample_depth(u, v, margin=5):
+        h, w = depth_raw.shape
+        vals = [depth_raw[int(v + dy), int(u + dx)] / 1000.0
+                for dy in range(-margin, margin + 1)
+                for dx in range(-margin, margin + 1)
+                if 0 <= int(u + dx) < w and 0 <= int(v + dy) < h]
+        vals = [d for d in vals if d > 0.05]
+        return float(np.median(vals)) if vals else 0.0
+
+    bboxes = json.loads(args.bboxes)
+    detections = []
+    for item in bboxes:
+        x1, y1, x2, y2 = item["bbox"]
+        u, v    = (x1 + x2) / 2, (y1 + y2) / 2
+        depth_m = _sample_depth(u, v)
+        world_xyz = _pixel_to_world(u, v, depth_m).tolist() if depth_m > 0 else None
+        detections.append({
+            "label":       item["label"],
+            "bbox":        [round(x, 1) for x in [x1, y1, x2, y2]],
+            "depth_m":     round(depth_m, 3),
+            "world_xyz_m": [round(c, 4) for c in world_xyz] if world_xyz else None,
+        })
+    print(json.dumps({"detections": detections}))
+
+
 def main():
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -104,11 +152,18 @@ def main():
     p_dwo.add_argument("--conf",      type=float, default=0.1)
     p_dwo.add_argument("--calib-dir", default=None)
 
+    p_b3d = sub.add_parser("bbox_to_3d")
+    p_b3d.add_argument("--depth",     required=True, help="depth .npy 文件路径")
+    p_b3d.add_argument("--bboxes",    required=True, help='JSON 数组: [{"label":..,"bbox":[x1,y1,x2,y2]},...]')
+    p_b3d.add_argument("--calib-dir", default=None)
+
     args = parser.parse_args()
     if args.cmd == "detect":
         detect(args)
     elif args.cmd == "detect_world_offline":
         detect_world_offline(args)
+    elif args.cmd == "bbox_to_3d":
+        bbox_to_3d(args)
 
 
 if __name__ == "__main__":
