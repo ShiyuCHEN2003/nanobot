@@ -101,6 +101,41 @@ def _uses_openrouter_attribution(spec: "ProviderSpec | None", api_base: str | No
     return bool(api_base and "openrouter" in api_base.lower())
 
 
+def _make_http_client():
+    """Build an httpx AsyncClient, normalising unsupported proxy schemes.
+
+    httpx rejects bare ``socks://`` URLs (valid values are ``socks5://`` /
+    ``socks5h://``).  We fix those before handing the map to httpx so that a
+    mis-configured system proxy env-var (e.g. ALL_PROXY=socks://…) does not
+    crash the provider at import / init time.
+    """
+    import httpx
+
+    _PROXY_ENV_KEYS = (
+        "HTTP_PROXY", "http_proxy",
+        "HTTPS_PROXY", "https_proxy",
+        "ALL_PROXY", "all_proxy",
+    )
+
+    mounts: dict[str, httpx.AsyncHTTPTransport | None] = {}
+    for key in _PROXY_ENV_KEYS:
+        url = os.environ.get(key)
+        if not url:
+            continue
+        # Normalise bare socks:// → socks5://
+        if url.startswith("socks://"):
+            url = "socks5://" + url[len("socks://"):]
+        scheme = url.split("://", 1)[0].lower() if "://" in url else ""
+        if scheme not in ("http", "https", "socks5", "socks5h"):
+            continue  # skip truly unknown schemes rather than crashing
+        transport = httpx.AsyncHTTPTransport(proxy=url)
+        mounts.setdefault("http://", transport)
+        mounts.setdefault("https://", transport)
+
+    # trust_env=False: prevent httpx from re-reading env proxy vars (we handle them above)
+    return httpx.AsyncClient(mounts=mounts, trust_env=False)
+
+
 class OpenAICompatProvider(LLMProvider):
     """Unified provider for all OpenAI-compatible APIs.
 
@@ -135,6 +170,7 @@ class OpenAICompatProvider(LLMProvider):
             api_key=api_key or "no-key",
             base_url=effective_base,
             default_headers=default_headers,
+            http_client=_make_http_client(),
         )
 
     def _setup_env(self, api_key: str, api_base: str | None) -> None:
