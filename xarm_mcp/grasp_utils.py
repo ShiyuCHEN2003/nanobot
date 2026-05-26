@@ -17,7 +17,7 @@ _ROOT = os.path.dirname(_HERE)
 
 SCENE_XML            = os.path.join(_HERE, "xml/scene.xml")
 RIGHT_ARM_QPOS_SLICE = slice(9, 16)
-PRE_GRASP_Z          = 0.15  # 预抓取点比目标高 10cm
+PRE_GRASP_Z          = 0.15  # 预抓取点比目标高 15cm
 CANPORT_DEFAULT      = "can2"
 INIT_Q7_DEG          = np.array([0, 20, 0, 60, 0, 0, 0], dtype=float)
 INIT_GRIPPER_DEG     = 0.0
